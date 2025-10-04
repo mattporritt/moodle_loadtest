@@ -1,0 +1,25 @@
+{
+  "base_url": "https://moodle.test",
+  "login_path": "/login/index.php",
+
+  "users": [
+    { "username": "perfuser01", "password": "pass01" },
+    { "username": "perfuser02", "password": "pass02" },
+    { "username": "perfuser03", "password": "pass03" }
+  ],
+
+  "parameters": {
+    "courseid": { "min": 2, "max": 500 },
+    "cmid":     { "min": 10, "max": 2000 },
+    "userid":   { "min": 5, "max": 10000 }
+  },
+
+  "urls": [
+    { "path": "/my/" },
+    { "path": "/course/view.php?id={courseid}" },
+    { "path": "/mod/forum/view.php?id={cmid}" },
+    { "path": "/user/profile.php?id={userid}" },
+    { "path": "/calendar/view.php" },
+    { "path": "/grade/report/overview/index.php" }
+  ]
+}
