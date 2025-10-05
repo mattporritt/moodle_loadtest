@@ -1,5 +1,5 @@
 {
-  "base_url": "https://moodle.test",
+  "base_url": "https://webserver",
   "login_path": "/login/index.php",
 
   "users": [

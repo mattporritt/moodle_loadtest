@@ -1,0 +1,4 @@
+# Python 3.10+ recommended
+aiohttp>=3.9,<4.0
+psycopg2-binary>=2.9
+bcrypt>=4.0
