@@ -1,45 +1,124 @@
 # Moodle LMS Load Generator (async)
 
-A small Python tool to generate consistent load against a Moodle test site for performance diagnostics and git-bisect hunts. It logs in a pool of users, hits configured URLs (with optional random integer placeholders), paces to a target RPM, and reports latency percentiles.
+A Python toolkit for generating consistent, reproducible load on a Moodle LMS test site.  
+It supports benchmarking different Moodle code versions (e.g. via `git bisect`), measuring performance, and restoring the site to a clean pre-test state.
+
+---
+
+## Overview
+
+This repository provides two primary Python scripts:
+
+1. **`moodle_load.py`** — Async load testing script that logs in test users and performs concurrent requests.
+2. **`set_moodle_passwords.py`** — Utility for connecting to a PostgreSQL Moodle database, resetting test user passwords to a known value, and populating the load test configuration.
+
+---
 
 ## Features
-- Username/password login against `/login/index.php` (handles `logintoken`)
-- URL templates with `{param}` placeholders resolved to random ints from configured ranges
-- Target requests-per-minute with async concurrency
-- Duration-based run with periodic progress snapshots and final stats
-- No JS/AJAX execution (by design for first-pass backend perf checks)
 
-## Quick start
+### Load Generator (`moodle_load.py`)
+- Logs in multiple users (handles Moodle `logintoken`)
+- Async parallel HTTP requests via `aiohttp`
+- Target RPM (requests per minute) and duration control
+- Randomised parameters in URLs (e.g. `{courseid}` → random int between range)
+- Reports RPM, success/failure count, and latency percentiles (p50/p95/p99)
+
+### Password Reset (`set_moodle_passwords.py`)
+- Connects directly to PostgreSQL
+- Selects test users (most recent or filtered with SQL)
+- Updates passwords (bcrypt) and sets `auth='manual'`
+- Updates `config.json` with usernames and passwords for load testing
+
+---
+
+## Setup
+
+### 1. Create and activate a virtual environment
+
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+python -m venv .venv
+source .venv/bin/activate     # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-
-# Run for 10 minutes (600s) at 600 RPM with 30 workers:
-python moodle_load.py   --config config.json   --rpm 600   --duration 600   --concurrency 30   --insecure
 ```
 
-> Use `--insecure` for local/self-signed TLS. Omit it for proper certificates.
+---
 
-## Configuration
-Create `config.json`:
+## Preparing the Moodle Test Site
+
+### Step 1: Generate test data
+
+Moodle provides a built-in command-line generator for seeding test users and data:
+
+```bash
+./bin/moodle-docker-compose exec webserver php public/admin/tool/generator/cli/maketestsite.php --size=M
+```
+
+This creates users, courses, activities, and forum discussions; enough to simulate typical LMS load.
+
+### Step 2: Reset test user passwords
+
+Use the password script to assign a known password and populate the `config.json` file:
+
+```bash
+python set_moodle_passwords.py \
+  --db-name moodle \
+  --db-user moodleuser \
+  --db-pass S3cret \
+  --db-host localhost \
+  --db-port 5433 \
+  --prefix m_ \
+  --count 50 \
+  --password Passw0rd! \
+  --config config.json
+```
+
+This will:
+- Update `mdl_user.password` to a bcrypt hash of `Passw0rd!`
+- Set `auth='manual'` and `confirmed=1`
+- Write the selected users and password to `config.json`
+
+### Step 3: Backup database before testing
+
+```bash
+pg_dump -U moodleuser -h localhost -F c -f pretest_backup.dump moodle
+```
+
+### Step 4: Run the load test
+
+```bash
+python moodle_load.py \
+  --config config.json \
+  --rpm 600 \
+  --duration 600 \
+  --concurrency 30 \
+  --insecure
+```
+
+### Step 5: Restore site to pre-test state
+
+```bash
+pg_restore -U moodleuser -h localhost -d moodle -c pretest_backup.dump
+```
+
+---
+
+## Configuration File (`config.json`)
+
+Example:
 
 ```json
 {
   "base_url": "https://moodle.test",
   "login_path": "/login/index.php",
-
   "users": [
-    { "username": "perfuser01", "password": "pass01" },
-    { "username": "perfuser02", "password": "pass02" }
+    { "username": "perfuser01", "password": "Passw0rd!" },
+    { "username": "perfuser02", "password": "Passw0rd!" }
   ],
-
   "parameters": {
     "courseid": { "min": 2, "max": 500 },
     "cmid":     { "min": 10, "max": 2000 },
     "userid":   { "min": 5, "max": 10000 }
   },
-
   "urls": [
     { "path": "/my/" },
     { "path": "/course/view.php?id={courseid}" },
@@ -49,10 +128,12 @@ Create `config.json`:
 }
 ```
 
-- `base_url` + `path` => final URL.
-- Any `{name}` in a path or query is replaced with a random int from `parameters[name]`.
+---
 
-## CLI
+## Command Reference
+
+### `moodle_load.py`
+
 ```
 --config PATH          Path to config.json (required)
 --rpm INT              Requests per minute target (required)
@@ -63,41 +144,70 @@ Create `config.json`:
 --progress INT         Progress print interval seconds (default: 30)
 ```
 
-## Output
-- Progress snapshots every `--progress` seconds with observed RPM and latency p50/p95/p99.
-- Final JSON summary printed to stdout, e.g.:
-```json
-{
-  "elapsed_sec": 600.1,
-  "total": 6000,
-  "success": 5987,
-  "failures": 13,
-  "req_per_min_observed": 599.1,
-  "latency_ms_p50": 120,
-  "latency_ms_p95": 380,
-  "latency_ms_p99": 640
-}
+### `set_moodle_passwords.py`
+
+```
+--db-name NAME         Database name (required)
+--db-user USER         Database user (required)
+--db-pass PASS         Database password (required)
+--db-host HOST         Database host (default: localhost)
+--db-port INT          Database port (default: 5432)
+--prefix STR           Table prefix (default: mdl_)
+--count INT            Number of users to update (default: 100)
+--password STR         New password for selected users (required)
+--config PATH          Path to load generator config.json (default: config.json)
+--where SQL            Optional SQL filter (no leading WHERE)
+--dry-run              Preview changes without modifying DB
 ```
 
-## Tips
-- Scale `--concurrency` up if the observed RPM is below target due to latency.
-- Tune URL mix in `config.json` to focus on hot paths (course view, quiz, gradebook, dashboard).
-- Ensure test users actually have access to the targeted pages (enrolments/permissions).
+---
 
-## Git bisect flow (suggested)
-1. Snapshot current commit performance with a fixed config and RPM.
-2. `git bisect start` → mark good/bad commits.
-3. Rebuild/redeploy test site at each step, run the same command, record p95/p99 and observed RPM.
-4. Narrow to the offending commit(s), then dive deeper (DB traces, PHP profiling, slow logs).
+## Understanding Output & Errors
 
-## Troubleshooting
-- **0 users logged in**: Check credentials and that `/login/index.php` is accessible; some themes/plugins change login flow.
-- **Observed RPM low**: Increase `--concurrency`, use faster client host, or reduce network latency.
-- **Many 403/404**: Users may lack access, or URLs require different params.
+| Message | Meaning |
+|----------|----------|
+| `[INFO] Logging in X users…` | Starting user authentication |
+| `[ERROR] Login failed for user` | Invalid credentials or mismatched auth method |
+| `[WARN] No logintoken for user` | Missing token – possible theme/custom login issue |
+| `[Request error: ...]` | Network or timeout issue during HTTP GET |
+| `[PROGRESS] {...}` | Current stats snapshot (RPM, latency) |
+| `req_per_min_observed` | Achieved request rate (RPM) |
+| `latency_ms_p95` | 95th percentile latency (ms) |
 
-## Roadmap (easy adds)
-- Per-URL weights and per-endpoint metrics
-- CSV/JSONL request logs
-- Exponential backoff & retries on transient errors
-- Ramp-up/warm-up phase
-- Fixed RNG seed for reproducible runs
+**Common fixes:**
+- Increase `--concurrency` if observed RPM < target.
+- Check that test users have course enrolments and permissions.
+- Verify site URL and login path are correct.
+- If many 403/404s occur, ensure URLs are valid for selected users.
+
+---
+
+## Ending the Test
+
+Deactivate the virtual environment when finished:
+
+```bash
+deactivate
+```
+
+---
+
+## Git Bisect Workflow
+
+1. Establish baseline performance metrics.  
+2. Run `git bisect start` and mark good/bad commits.  
+3. Rebuild and restore the DB at each step.  
+4. Run the same test, record p95/p99 latency and observed RPM.  
+5. Narrow to the commit introducing the regression.
+
+---
+
+## Requirements
+
+```
+aiohttp>=3.9,<4.0
+psycopg2-binary>=2.9
+bcrypt>=4.0
+```
+
+---
