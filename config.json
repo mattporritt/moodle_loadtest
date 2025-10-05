@@ -1,19 +1,25 @@
 {
   "base_url": "https://webserver",
   "login_path": "/login/index.php",
-
   "users": [
     { "username": "perfuser01", "password": "pass01" },
     { "username": "perfuser02", "password": "pass02" },
     { "username": "perfuser03", "password": "pass03" }
   ],
-
   "parameters": {
-    "courseid": { "min": 2, "max": 500 },
-    "cmid":     { "min": 10, "max": 2000 },
-    "userid":   { "min": 5, "max": 10000 }
+    "courseid": {
+      "min": 2,
+      "max": 70
+    },
+    "cmid": {
+      "min": 10,
+      "max": 200
+    },
+    "userid": {
+      "min": 2,
+      "max": 1000
+    }
   },
-
   "urls": [
     { "path": "/my/" },
     { "path": "/course/view.php?id={courseid}" },

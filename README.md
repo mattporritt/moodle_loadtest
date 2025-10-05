@@ -31,18 +31,6 @@ This repository provides two primary Python scripts:
 
 ---
 
-## Setup
-
-### 1. Create and activate a virtual environment
-
-```bash
-python -m venv .venv
-source .venv/bin/activate     # On Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-```
-
----
-
 ## Preparing the Moodle Test Site
 
 ### Step 1: Generate test data
@@ -55,12 +43,20 @@ Moodle provides a built-in command-line generator for seeding test users and dat
 
 This creates users, courses, activities, and forum discussions; enough to simulate typical LMS load.
 
-### Step 2: Reset test user passwords
+### Step 2. Create and activate a virtual environment
+
+```bash
+python -m venv .venv
+source .venv/bin/activate     # On Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### Step 3: Reset test user passwords
 
 Use the password script to assign a known password and populate the `config.json` file:
 
 ```bash
-python set_moodle_passwords.py \
+python3 set_moodle_passwords.py \
   --db-name moodle \
   --db-user moodleuser \
   --db-pass S3cret \
@@ -77,16 +73,16 @@ This will:
 - Set `auth='manual'` and `confirmed=1`
 - Write the selected users and password to `config.json`
 
-### Step 3: Backup database before testing
+### Step 4: Backup database before testing
 
 ```bash
-pg_dump -U moodleuser -h localhost -F c -f pretest_backup.dump moodle
+pg_dump -U moodle -h 127.0.0.1 -p 5433 -Fc -f pretest_backup.dump moodle
 ```
 
-### Step 4: Run the load test
+### Step 5: Run the load test
 
 ```bash
-python moodle_load.py \
+python3 moodle_load.py \
   --config config.json \
   --rpm 600 \
   --duration 600 \
@@ -94,7 +90,7 @@ python moodle_load.py \
   --insecure
 ```
 
-### Step 5: Restore site to pre-test state
+### Step 6: Restore site to pre-test state
 
 ```bash
 pg_restore -U moodleuser -h localhost -d moodle -c pretest_backup.dump
