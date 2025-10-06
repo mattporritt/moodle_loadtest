@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 """
-set_moodle_passwords.py — Prepare test users for load runs (PostgreSQL)
+set_moodle_passwords.py
+=======================
+Utility to reset passwords for a subset of Moodle users and populate the
+load generator configuration file with those credentials.
 
 What it does
 ------------
-- Connects directly to a Moodle PostgreSQL database.
-- Selects a number of (non-deleted, non-suspended, id>2) users (most recent first).
-- Sets their password to a *known* bcrypt value and forces `auth='manual'`.
-- Writes the selected usernames + plaintext password into your load `config.json`.
+- Connects directly to a PostgreSQL Moodle database
+- Selects a set of user accounts (most recent first; excludes system users)
+- Updates `mdl_user.password` with a bcrypt hash of your chosen password
+- Sets `auth='manual'` and `confirmed=1` to ensure interactive login works
+- Writes the selected usernames + the clear-text password into `config.json`
 
-Why direct DB updates?
-----------------------
-For performance test harnessing we often need a large pool of known credentials.
-Doing this directly is fast and reproducible. **Run this only against test DBs.**
-
-Security note
--------------
-The load generator needs the plaintext password, so this script writes it into
-`config.json` for convenience. Treat that file as sensitive and keep it out of
-any production contexts or public repos.
+Safety
+------
+Run this only against non-production databases. It permanently changes user
+passwords for the selected accounts.
 """
+from __future__ import annotations
 
 import argparse
 import json
@@ -34,7 +33,9 @@ from psycopg2.extras import RealDictCursor
 
 @dataclass
 class DBConfig:
-    """Connection parameters for PostgreSQL."""
+    """
+    Connection parameters for PostgreSQL.
+    """
     host: str
     port: int
     dbname: str
@@ -43,25 +44,38 @@ class DBConfig:
 
 
 def parse_args() -> argparse.Namespace:
-    """CLI for selecting and updating test users and emitting config.json."""
-    p = argparse.ArgumentParser(description="Set known passwords for Moodle users and populate load config.json")
+    """
+    Define and parse all CLI flags for this utility.
+    """
+    p = argparse.ArgumentParser(
+        description="Set known passwords for Moodle users and populate load config.json"
+    )
     p.add_argument("--db-host", default="localhost", help="Postgres host")
     p.add_argument("--db-port", type=int, default=5432, help="Postgres port")
     p.add_argument("--db-name", required=True, help="Postgres database name")
     p.add_argument("--db-user", required=True, help="Postgres user")
     p.add_argument("--db-pass", required=True, help="Postgres password")
     p.add_argument("--prefix", default="mdl_", help="Moodle table prefix (default: mdl_)")
-    p.add_argument("--count", type=int, default=100, help="How many users to update (default: 100)")
-    p.add_argument("--password", required=True, help="New clear-text password for all selected users")
-    p.add_argument("--config", default="config.json", help="Path to load generator config.json to update")
-    p.add_argument("--where", default=None, help="Optional SQL filter (without leading WHERE), e.g. \"username LIKE 'perf%%'\"")
-    p.add_argument("--dry-run", action="store_true", help="Print affected users but do not modify DB")
+    p.add_argument("--count", type=int, default=100, help="Number of users to update (default: 100)")
+    p.add_argument("--password", required=True, help="New clear-text password for selected users")
+    p.add_argument("--config", default="config.json", help="Path to load generator config.json")
+    p.add_argument(
+        "--where",
+        default=None,
+        help="Optional SQL filter expression (without leading WHERE). "
+             "Example: \"email LIKE 'test+%%' OR username LIKE 'perf%%'\"",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Do not modify DB; only print and update config.json")
     p.add_argument("--bcrypt-cost", type=int, default=12, help="bcrypt cost factor (default: 12)")
     return p.parse_args()
 
 
 def make_conn(cfg: DBConfig):
-    """Open a psycopg2 connection."""
+    """
+    Open a PostgreSQL connection using plain psycopg2.
+
+    Returns a live connection; caller is responsible for closing it.
+    """
     return psycopg2.connect(
         host=cfg.host,
         port=cfg.port,
@@ -73,33 +87,41 @@ def make_conn(cfg: DBConfig):
 
 def select_users(conn, prefix: str, count: int, where_clause: Optional[str]) -> List[dict]:
     """
-    Return recent Moodle users (id desc) that are eligible for test logins.
+    Select candidate users to update.
 
-    Baseline WHERE:
+    Default filter excludes deleted/suspended/system users:
       - deleted = 0
-      - id > 2 (skips admin/guest/system)
       - suspended = 0
-    Extra filters can be provided via --where (no leading WHERE).
+      - id > 2 (skip guest/admin)
+
+    The selection is ordered by most recent (id DESC). You may append additional
+    conditions using --where (no leading WHERE).
     """
     tbl = f"{prefix}user"
     where_parts = [f"{tbl}.deleted = 0", f"{tbl}.id > 2", f"{tbl}.suspended = 0"]
     if where_clause:
         where_parts.append(f"({where_clause})")
     where_sql = " AND ".join(where_parts)
+
     sql = f"""
-    SELECT id, username, email, auth
-    FROM {tbl}
-    WHERE {where_sql}
-    ORDER BY id DESC
-    LIMIT %s
+        SELECT id, username, email, auth
+        FROM {tbl}
+        WHERE {where_sql}
+        ORDER BY id DESC
+        LIMIT %s
     """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(sql, (count,))
-        return cur.fetchall()
+        return cur.fetchall()  # each row is a dict
 
 
 def make_bcrypt_hash(plain: str, cost: int) -> bytes:
-    """Generate a bcrypt hash compatible with PHP's password_verify()."""
+    """
+    Create a bcrypt hash bytes for the given clear-text password.
+
+    Moodle (PHP) uses password_hash/password_verify behind the scenes; bcrypt
+    outputs are compatible.
+    """
     pw = plain.encode("utf-8")
     salt = bcrypt.gensalt(rounds=cost)
     return bcrypt.hashpw(pw, salt)  # bytes
@@ -107,15 +129,16 @@ def make_bcrypt_hash(plain: str, cost: int) -> bytes:
 
 def update_users(conn, prefix: str, user_rows: List[dict], bcrypt_hash: bytes, dry_run: bool = False) -> None:
     """
-    Update each selected user's password hash and set auth='manual'.
+    Apply the new hash to the selected users.
 
-    We also set confirmed=1 to avoid login prompts in some flows.
+    We also set `auth='manual'` (to ensure user-pass login works) and
+    `confirmed=1` (some flows check for confirmed users).
     """
     tbl = f"{prefix}user"
     sql = f"""
-    UPDATE {tbl}
-    SET password = %s, auth = 'manual', confirmed = 1
-    WHERE id = %s
+        UPDATE {tbl}
+        SET password = %s, auth = 'manual', confirmed = 1
+        WHERE id = %s
     """
     with conn.cursor() as cur:
         for r in user_rows:
@@ -132,8 +155,9 @@ def update_users(conn, prefix: str, user_rows: List[dict], bcrypt_hash: bytes, d
 
 def update_config_json(config_path: str, users: List[dict], new_password: str) -> None:
     """
-    Merge/update the target config.json with a fresh 'users' list that pairs
-    each selected username with the provided plaintext password (for the load generator).
+    Overwrite or create the users block in config.json with selected users.
+
+    We leave other keys (base_url, login_path, parameters, urls) as-is.
     """
     try:
         with open(config_path, "r", encoding="utf-8") as f:
@@ -151,9 +175,15 @@ def update_config_json(config_path: str, users: List[dict], new_password: str) -
     print(f"[CONFIG] Wrote {len(users)} users to {config_path}")
 
 
-def main():
+def main() -> None:
+    """
+    Entry point for CLI execution.
+    """
     args = parse_args()
-    dbcfg = DBConfig(args.db_host, args.db_port, args.db_name, args.db_user, args.db_pass)
+    dbcfg = DBConfig(
+        host=args.db_host, port=args.db_port, dbname=args.db_name, user=args.db_user, password=args.db_pass
+    )
+
     try:
         conn = make_conn(dbcfg)
     except Exception as e:
@@ -179,7 +209,9 @@ def main():
             print("[INFO] Updating user passwords in DB...")
         update_users(conn, args.prefix, users, bcrypt_hash, dry_run=args.dry_run)
 
+        # Finally reflect the user list + clear-text password into config.json
         update_config_json(args.config, users, args.password)
+
     finally:
         conn.close()
 

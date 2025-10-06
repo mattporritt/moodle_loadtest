@@ -135,7 +135,7 @@ stats/moodlemaster-db-1_<timestamp>_<tag>.csv
 
 ---
 
-## 🧩 Combined Test Workflow (Recommended)
+## Combined Test Workflow (Recommended)
 
 Run both load generation and Docker monitoring together for complete performance profiling.
 
