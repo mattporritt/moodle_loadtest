@@ -1,29 +1,16 @@
 #!/usr/bin/env python3
 """
-capture_docker_stats.py
-
-Capture CPU% and memory usage for one or more Docker containers at a fixed interval,
-writing one CSV per container. Useful for pairing with load tests / git bisect runs.
-
-Requirements:
-  pip install docker
-
-Example:
-  python capture_docker_stats.py \    --containers moodlemaster-webserver-1 moodlemaster-db-1 \    --interval 1 --duration 600 --outdir stats --tag $(git rev-parse --short HEAD)
-
-Output files (created under --outdir):
-  stats/<container>_<YYYYmmdd-HHMMSS>_<tag>.csv
+Capture CPU%, memory, PIDs, net bytes, and block I/O for selected Docker containers.
+Writes one CSV per container and prints a periodic, human-readable table to the terminal.
 """
 import argparse
 import csv
-import os
 import signal
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
-
 import docker
 
 def human_bytes(n: Optional[int]) -> str:
@@ -40,19 +27,9 @@ def cpu_percent(prev: Optional[dict], cur: dict) -> float:
     try:
         if prev is None:
             return 0.0
-        cpu_delta = (
-            cur["cpu_stats"]["cpu_usage"]["total_usage"]
-            - prev["cpu_stats"]["cpu_usage"]["total_usage"]
-        )
-        sys_delta = (
-            cur["cpu_stats"]["system_cpu_usage"]
-            - prev["cpu_stats"]["system_cpu_usage"]
-        )
-        cpus = (
-            cur["cpu_stats"].get("online_cpus")
-            or len(cur["cpu_stats"]["cpu_usage"].get("percpu_usage", []))
-            or 1
-        )
+        cpu_delta = cur["cpu_stats"]["cpu_usage"]["total_usage"] - prev["cpu_stats"]["cpu_usage"]["total_usage"]
+        sys_delta = cur["cpu_stats"]["system_cpu_usage"] - prev["cpu_stats"]["system_cpu_usage"]
+        cpus = cur["cpu_stats"].get("online_cpus") or len(cur["cpu_stats"]["cpu_usage"].get("percpu_usage", [])) or 1
         if cpu_delta > 0 and sys_delta > 0:
             return (cpu_delta / sys_delta) * cpus * 100.0
         return 0.0
@@ -79,14 +56,31 @@ def blk_bytes(cur: dict) -> Tuple[Optional[int], Optional[int]]:
     except Exception:
         return None, None
 
+def _format_table(headers, rows):
+    cols = len(headers)
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i in range(cols):
+            widths[i] = max(widths[i], len(str(row[i]) if i < len(row) else ""))
+    sep = "+".join("-" * (w + 2) for w in widths)
+    lines = []
+    header_line = " | ".join(str(h).ljust(widths[i]) for i, h in enumerate(headers))
+    lines.append(header_line)
+    lines.append(sep)
+    for row in rows:
+        line = " | ".join(str(row[i]).ljust(widths[i]) for i in range(cols))
+        lines.append(line)
+    return "\n".join(lines)
+
 def main():
-    ap = argparse.ArgumentParser(description="Capture docker stats to CSV for selected containers.")
-    ap.add_argument("--containers", nargs="+", required=True, help="Container names or IDs (space-separated)")
-    ap.add_argument("--interval", type=float, default=1.0, help="Sampling interval in seconds (default: 1)")
-    ap.add_argument("--duration", type=int, default=600, help="Total duration in seconds (default: 600)")
-    ap.add_argument("--outdir", default="stats", help="Output directory for CSV files (default: stats)")
-    ap.add_argument("--tag", default="", help="Optional tag to include in filenames (e.g., git hash)")
-    ap.add_argument("--human", action="store_true", help="Also write human-readable columns for memory and IO")
+    ap = argparse.ArgumentParser(description="Capture docker stats to CSV for selected containers, with table output.")
+    ap.add_argument("--containers", nargs="+", required=True, help="Container names or IDs")
+    ap.add_argument("--interval", type=float, default=1.0, help="Sampling interval seconds (default: 1)")
+    ap.add_argument("--duration", type=int, default=600, help="Total duration seconds (default: 600)")
+    ap.add_argument("--outdir", default="stats", help="Directory for output CSV files (default: stats)")
+    ap.add_argument("--tag", default="", help="Optional tag in filenames (e.g., git hash)")
+    ap.add_argument("--human", action="store_true", help="Append human-readable columns to CSV")
+    ap.add_argument("--print-interval", type=int, default=5, help="How often (seconds) to print table snapshot (default: 5)")
     args = ap.parse_args()
 
     client = docker.from_env()
@@ -108,30 +102,16 @@ def main():
     writers: Dict[str, csv.writer] = {}
     files = {}
     prev_stats: Dict[str, Optional[dict]] = {k: None for k in targets.keys()}
+    last_print = time.time()
 
     suffix = f"_{args.tag}" if args.tag else ""
 
     headers = [
-        "timestamp",
-        "container",
-        "cpu_percent",
-        "mem_used_bytes",
-        "mem_limit_bytes",
-        "pids",
-        "net_rx_bytes",
-        "net_tx_bytes",
-        "blk_read_bytes",
-        "blk_write_bytes",
+        "timestamp","container","cpu_percent","mem_used_bytes","mem_limit_bytes","pids",
+        "net_rx_bytes","net_tx_bytes","blk_read_bytes","blk_write_bytes",
     ]
     if args.human:
-        headers += [
-            "mem_used_human",
-            "mem_limit_human",
-            "net_rx_human",
-            "net_tx_human",
-            "blk_read_human",
-            "blk_write_human",
-        ]
+        headers += ["mem_used_human","mem_limit_human","net_rx_human","net_tx_human","blk_read_human","blk_write_human"]
 
     for name in targets.keys():
         path = outdir / f"{name}_{ts_str}{suffix}.csv"
@@ -151,6 +131,8 @@ def main():
 
     start = time.time()
     next_tick = start
+    latest_rows: Dict[str, Dict[str, str]] = {}
+
     while not stop and (time.time() - start) < args.duration:
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%S")
         for name, ctr in targets.items():
@@ -167,21 +149,31 @@ def main():
             rx, tx   = net_bytes(s)
             rb, wb   = blk_bytes(s)
 
-            row = [
-                now_iso, name, f"{cpu:.2f}", mem_used, mem_lim, pids, rx, tx, rb, wb
-            ]
+            row = [now_iso, name, f"{cpu:.2f}", mem_used, mem_lim, pids, rx, tx, rb, wb]
             if args.human:
-                row += [
-                    human_bytes(mem_used),
-                    human_bytes(mem_lim),
-                    human_bytes(rx),
-                    human_bytes(tx),
-                    human_bytes(rb),
-                    human_bytes(wb),
-                ]
-
+                row += [human_bytes(mem_used), human_bytes(mem_lim), human_bytes(rx), human_bytes(tx), human_bytes(rb), human_bytes(wb)]
             writers[name].writerow(row)
+            files[name].flush()
             prev_stats[name] = s
+
+            latest_rows[name] = {
+                "container": name,
+                "cpu": f"{cpu:.2f}%",
+                "mem": f"{human_bytes(mem_used)}/{human_bytes(mem_lim)}" if args.human else f"{mem_used}/{mem_lim}",
+                "pids": str(pids or ""),
+                "net": f"rx {human_bytes(rx)} tx {human_bytes(tx)}" if args.human else f"rx {rx} tx {tx}",
+                "blk": f"r {human_bytes(rb)} w {human_bytes(wb)}" if args.human else f"r {rb} w {wb}",
+            }
+
+        if (time.time() - last_print) >= args.print_interval:
+            headers_tbl = ["Container","CPU%","Memory (used/limit)","PIDs","Net (rx/tx)","Block I/O (r/w)"]
+            rows_tbl = []
+            for cname in sorted(latest_rows.keys()):
+                r = latest_rows[cname]
+                rows_tbl.append([r["container"], r["cpu"], r["mem"], r["pids"], r["net"], r["blk"]])
+            if rows_tbl:
+                print("\n[CONTAINER STATS]\n" + _format_table(headers_tbl, rows_tbl))
+            last_print = time.time()
 
         next_tick += args.interval
         sleep_for = max(0.0, next_tick - time.time())
