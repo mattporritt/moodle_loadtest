@@ -4,6 +4,7 @@ A Python toolkit for generating **repeatable load** on a Moodle LMS test site an
 Includes:
 - Async load testing with progress tables + CSV output  
 - Docker resource capture with live container tables  
+- PostgreSQL **database restore** utility for consistent, per-run resets  
 - End-to-end bisect automation support
 
 ---
@@ -15,6 +16,7 @@ Includes:
 | **`moodle_load.py`** | Async load generator — logs in users, hits URLs, prints tables, writes CSV. |
 | **`set_moodle_passwords.py`** | Resets test user passwords (Postgres) and populates `config.json`. |
 | **`capture_docker_stats.py`** | Captures Docker CPU/mem/net I/O with live table and CSV output. |
+| **`restore_moodle_db.py`** | **New:** Restores the Moodle Postgres DB from a `pg_dump -F c` snapshot (clean or drop modes). |
 | **`requirements.txt`** | Python dependencies. |
 
 ---
@@ -41,7 +43,7 @@ deactivate
 ### Step 1: Seed test data
 
 ```bash
-./bin/moodle-docker-compose exec webserver php public/admin/tool/generator/cli/maketestsite.php --size=M
+./bin/moodle-docker-compose exec webserver   php public/admin/tool/generator/cli/maketestsite.php --size=M
 ```
 
 ### Step 2: Reset passwords and update config
@@ -50,10 +52,12 @@ deactivate
 python set_moodle_passwords.py   --db-name moodle   --db-user moodleuser   --db-pass S3cret   --db-host localhost   --count 200   --password Passw0rd!   --config config.json
 ```
 
-### Step 3: Backup the database
+### Step 3: Backup the database (pre-test snapshot)
+
+Create a **custom-format** dump so restores are fast and portable:
 
 ```bash
-pg_dump -U moodleuser -h localhost -F c -f pretest_backup.dump moodle
+pg_dump -U moodleuser -h localhost -F c -f pretest_backup.dump   --no-owner --no-privileges moodle
 ```
 
 ---
@@ -135,9 +139,44 @@ stats/moodlemaster-db-1_<timestamp>_<tag>.csv
 
 ---
 
+## Database Restore Between Runs (New)
+
+Use **`restore_moodle_db.py`** to reset the database to your pre-test snapshot.
+
+> Assumes the dump was created with:  
+> `pg_dump -F c --no-owner --no-privileges`
+
+### Clean restore (default; no dropdb)
+Keeps the database, drops/recreates all objects from the dump:
+```bash
+python restore_moodle_db.py   --db-name moodle   --db-user moodleuser   --db-pass S3cret   --db-host localhost   --dump pretest_backup.dump   --mode clean   --jobs 4
+```
+
+### Drop & recreate database
+Preferred when you want a full DB reset (requires DROP/CREATE privileges):
+```bash
+python restore_moodle_db.py   --db-name moodle   --db-user moodleuser   --db-pass S3cret   --db-host localhost   --dump pretest_backup.dump   --mode drop   --jobs 4
+```
+
+**Options**
+- `--jobs N` : Parallel workers for `pg_restore -j` (defaults to 4).  
+- `--pg-restore-path PATH` : Use a specific `pg_restore` binary (optional).  
+- `--skip-analyze` : Skip the final `ANALYZE;` step.
+
+**What the restore script does**
+1. Terminates active sessions to the target DB (avoids lock errors).  
+2. Either:  
+   - **clean**: in-place restore with `pg_restore --clean --if-exists`, or  
+   - **drop**: `DROP DATABASE` / `CREATE DATABASE` then restore.  
+3. Runs `ANALYZE;` to refresh planner stats (can be disabled).
+
+**Docker note:** If Postgres runs in Docker without a published port, either publish `5432` or `docker exec` the `pg_dump`/`pg_restore` commands inside the container. The Python restore script can run anywhere it can reach the DB host.
+
+---
+
 ## Combined Test Workflow (Recommended)
 
-Run both load generation and Docker monitoring together for complete performance profiling.
+Run both load generation and Docker monitoring in parallel; reset DB between runs using the restore script.
 
 ```bash
 # Clean up and prepare
@@ -146,7 +185,6 @@ rm -rf stats && mkdir stats
 # Start Docker stats capture in the background
 python capture_docker_stats.py   --containers moodlemaster-webserver-1 moodlemaster-db-1   --interval 1   --duration 600   --outdir stats   --tag $(git rev-parse --short HEAD)   --human   --print-interval 10 &
 
-# Capture its PID
 CAPTURE_PID=$!
 
 # Run the load test
@@ -154,23 +192,9 @@ python moodle_load.py   --config config.json   --rpm 600   --duration 600   --co
 
 # Wait for Docker capture to finish
 wait $CAPTURE_PID
-```
 
-This produces synchronized load and resource data sets:
-```
-stats/
- ├─ load_progress_<timestamp>.csv
- ├─ load_summary_<timestamp>.csv
- ├─ moodlemaster-webserver-1_<timestamp>_<tag>.csv
- └─ moodlemaster-db-1_<timestamp>_<tag>.csv
-```
-
----
-
-## Restoring Site to Pre-Test State
-
-```bash
-pg_restore -U moodleuser -h localhost -d moodle -c pretest_backup.dump
+# Reset DB to snapshot for next run
+python restore_moodle_db.py   --db-name moodle   --db-user moodleuser   --db-pass S3cret   --db-host localhost   --dump pretest_backup.dump   --mode clean   --jobs 4
 ```
 
 ---
@@ -210,10 +234,3 @@ This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
 Foundation, either version 3 of the License, or (at your option) any later
 version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE.  See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with
-this program.  If not, see <http://www.gnu.org/licenses/>.
