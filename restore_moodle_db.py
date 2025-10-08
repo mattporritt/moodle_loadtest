@@ -135,6 +135,7 @@ def run_pg_restore(
         "-U", cfg.user,
         "-h", cfg.host,
         "-d", cfg.dbname,
+        "-p", str(cfg.port),
         "--no-owner",
         "--no-privileges",
         "-j", str(max(1, jobs)),

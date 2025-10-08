@@ -42,14 +42,27 @@ deactivate
 
 ### Step 1: Seed test data
 
+Example: On webserver directly:
 ```bash
-./bin/moodle-docker-compose exec webserver   php public/admin/tool/generator/cli/maketestsite.php --size=M
+php public/admin/tool/generator/cli/maketestsite.php --size=M
+```
+
+Example: Docker based webserver:
+```bash
+./bin/moodle-docker-compose exec webserver php public/admin/tool/generator/cli/maketestsite.php --size=M
 ```
 
 ### Step 2: Reset passwords and update config
 
 ```bash
-python set_moodle_passwords.py   --db-name moodle   --db-user moodleuser   --db-pass S3cret   --db-host localhost   --count 200   --password Passw0rd!   --config config.json
+python set_moodle_passwords.py \
+  --db-name moodle \
+  --db-user moodleuser \
+  --db-pass S3cret \
+  --db-host localhost \
+  --count 200 \
+  --password Passw0rd! \
+  --config config.json
 ```
 
 ### Step 3: Backup the database (pre-test snapshot)
@@ -57,7 +70,12 @@ python set_moodle_passwords.py   --db-name moodle   --db-user moodleuser   --db-
 Create a **custom-format** dump so restores are fast and portable:
 
 ```bash
-pg_dump -U moodleuser -h localhost -F c -f pretest_backup.dump   --no-owner --no-privileges moodle
+pg_dump -U moodle \
+    -h localhost \
+    -p 5433 \
+    -F c -f pretest_backup.dump \
+    --no-owner \
+    --no-privileges moodle
 ```
 
 ---
@@ -87,7 +105,13 @@ pg_dump -U moodleuser -h localhost -F c -f pretest_backup.dump   --no-owner --no
 ## Running the Load Test
 
 ```bash
-python moodle_load.py   --config config.json   --rpm 600   --duration 600   --concurrency 30   --stats-dir stats   --insecure
+python moodle_load.py \
+    --config config.json \
+    --rpm 600 \
+    --duration 600 \
+    --concurrency 30 \
+    --stats-dir stats \
+    --insecure
 ```
 
 ### Output example
@@ -118,7 +142,14 @@ stats/load_summary_<timestamp>.csv
 ## Monitoring Docker Containers
 
 ```bash
-python capture_docker_stats.py   --containers moodlemaster-webserver-1 moodlemaster-db-1   --interval 1   --duration 600   --outdir stats   --tag $(git rev-parse --short HEAD)   --human   --print-interval 5
+python capture_docker_stats.py \
+    --containers moodlemaster-webserver-1 moodlemaster-db-1 \
+    --interval 1 \
+    --duration 600 \
+    --outdir stats \
+    --tag $(git rev-parse --short HEAD) \
+    --human \
+    --print-interval 5
 ```
 
 ### Console table output
@@ -149,13 +180,28 @@ Use **`restore_moodle_db.py`** to reset the database to your pre-test snapshot.
 ### Clean restore (default; no dropdb)
 Keeps the database, drops/recreates all objects from the dump:
 ```bash
-python restore_moodle_db.py   --db-name moodle   --db-user moodleuser   --db-pass S3cret   --db-host localhost   --dump pretest_backup.dump   --mode clean   --jobs 4
+python restore_moodle_db.py \
+  --db-name moodle \
+  --db-user moodleuser \
+  --db-pass S3cret \
+  --db-host localhost \
+  --db-port 5433 \
+  --dump pretest_backup.dump \
+  --mode clean \
+  --jobs 4
 ```
 
 ### Drop & recreate database
 Preferred when you want a full DB reset (requires DROP/CREATE privileges):
 ```bash
-python restore_moodle_db.py   --db-name moodle   --db-user moodleuser   --db-pass S3cret   --db-host localhost   --dump pretest_backup.dump   --mode drop   --jobs 4
+python restore_moodle_db.py \
+  --db-name moodle \
+  --db-user moodleuser \
+  --db-pass S3cret \
+  --db-host localhost \
+  --dump pretest_backup.dump \
+  --mode drop \
+  --jobs 4
 ```
 
 **Options**
@@ -183,18 +229,38 @@ Run both load generation and Docker monitoring in parallel; reset DB between run
 rm -rf stats && mkdir stats
 
 # Start Docker stats capture in the background
-python capture_docker_stats.py   --containers moodlemaster-webserver-1 moodlemaster-db-1   --interval 1   --duration 600   --outdir stats   --tag $(git rev-parse --short HEAD)   --human   --print-interval 10 &
+python capture_docker_stats.py \
+  --containers moodlemaster-webserver-1 moodlemaster-db-1 \
+  --interval 1 \
+  --duration 600 \
+  --outdir stats \
+  --tag $(git rev-parse --short HEAD) \
+  --human \
+  --print-interval 10 &
 
 CAPTURE_PID=$!
 
 # Run the load test
-python moodle_load.py   --config config.json   --rpm 600   --duration 600   --concurrency 30   --stats-dir stats   --insecure
+python moodle_load.py \
+  --config config.json \
+  --rpm 600 \
+  --duration 600 \
+  --concurrency 30 \
+  --stats-dir stats \
+  --insecure
 
 # Wait for Docker capture to finish
 wait $CAPTURE_PID
 
 # Reset DB to snapshot for next run
-python restore_moodle_db.py   --db-name moodle   --db-user moodleuser   --db-pass S3cret   --db-host localhost   --dump pretest_backup.dump   --mode clean   --jobs 4
+python restore_moodle_db.py \
+  --db-name moodle \
+  --db-user moodleuser \
+  --db-pass S3cret \
+  --db-host localhost \
+  --dump pretest_backup.dump \
+  --mode clean \
+  --jobs 4
 ```
 
 ---
