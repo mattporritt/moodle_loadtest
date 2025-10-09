@@ -2,27 +2,10 @@
 """
 moodle_load.py
 ==============
-Async load generator for Moodle LMS.
-
-Purpose
--------
-This script logs in a pool of Moodle users and repeatedly requests a set of URL
-templates at a target requests-per-minute (RPM) rate for a fixed duration.
-It prints human-readable progress/summary tables to the terminal *and* writes
-CSV snapshots/summary for later analysis (useful for git-bisect runs).
-
-Key characteristics
--------------------
-- Uses aiohttp for concurrency and connection pooling
-- Handles Moodle login (logintoken + MoodleSession cookie check)
-- Supports URL templates with integer placeholders (e.g. '/course/view.php?id={courseid}')
-- Enforces approximate RPM by pacing a producer; workers pull from an async queue
-- Emits periodic progress and an end-of-run summary as both tables and CSV rows
-
-Typical usage
--------------
-python moodle_load.py --config config.json --rpm 600 --duration 600 \
-  --concurrency 30 --stats-dir stats --insecure
+Async load generator for Moodle LMS with:
+- throttled login to avoid DOSing the server,
+- bounded socket usage per session,
+- human-readable progress tables and CSV capture.
 """
 from __future__ import annotations
 
@@ -229,7 +212,6 @@ def render_path(tpl: str, parameters: Dict[str, ParamRange]) -> str:
             raise ValueError(f"No parameter range defined for {{{name}}} in URL '{tpl}'")
         pr = parameters[name]
         return str(random.randint(pr.min, pr.max))
-
     return re.sub(r"\{([a-zA-Z0-9_]+)\}", repl, tpl)
 
 
@@ -251,6 +233,8 @@ async def login_user(
     cred: UserCred,
     insecure_tls: bool,
     timeout: int = 20,
+    connector_limit: int = 8,
+    connector_limit_per_host: int = 4,
 ) -> Optional[ClientSession]:
     """
     Create a dedicated session per user and attempt login.
@@ -264,11 +248,17 @@ async def login_user(
         * a 'MoodleSession*' cookie is set
     - If login fails, close the session to free sockets.
     """
-    connector = TCPConnector(ssl=False) if insecure_tls else TCPConnector(ssl=None)
+    connector = TCPConnector(
+        ssl=False if insecure_tls else None,
+        limit=max(1, connector_limit),
+        limit_per_host=max(1, connector_limit_per_host),
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+    )
     session = ClientSession(
         connector=connector,
         timeout=aiohttp.ClientTimeout(total=timeout),
-        headers={"User-Agent": "moodle-loadgen/1.2"},
+        headers={"User-Agent": "moodle-loadgen/1.3"},
         cookie_jar=aiohttp.CookieJar(unsafe=insecure_tls),
     )
     try:
@@ -304,9 +294,8 @@ async def login_user(
 async def worker(
     name: str,
     base_url: str,
-    job_q: "asyncio.Queue[Tuple[ClientSession, UrlTemplate, Dict[str, ParamRange]]]",
-    stats: Stats,
-) -> None:
+    job_q: "asyncio.Queue",
+    stats: Stats):
     """
     Consume jobs from the queue and perform HTTP GETs.
 
@@ -353,13 +342,12 @@ async def worker(
 
 
 async def producer(
-    job_q: "asyncio.Queue[Tuple[ClientSession, UrlTemplate, Dict[str, ParamRange]]]",
+    job_q: "asyncio.Queue",
     sessions: List[ClientSession],
     url_templates: List[UrlTemplate],
     param_ranges: Dict[str, ParamRange],
     rpm: int,
-    duration_sec: int,
-) -> None:
+    duration_sec: int):
     """
     Pace requests into the queue to approximate the target RPM.
 
@@ -397,7 +385,7 @@ def _csv_header() -> List[str]:
     ]
 
 
-def _csv_row(now_iso: str, snap: Dict[str, Any]) -> List[Any]:
+def _csv_row(now_iso: str, snap: Dict[str, Any]):
     """
     Serialize a stats snapshot into a CSV row with a timestamp prefix.
     """
@@ -411,11 +399,9 @@ def _csv_row(now_iso: str, snap: Dict[str, Any]) -> List[Any]:
         snap["failures"],
         snap["latency_ms_p50"] if snap["latency_ms_p50"] is not None else "",
         snap["latency_ms_p95"] if snap["latency_ms_p95"] is not None else "",
-        snap["latency_ms_p99"] if snap["latency_ms_p99"] is not None else "",
-    ]
+        snap["latency_ms_p99"] if snap["latency_ms_p99"] is not None else ""]
 
 
-# ---------- Orchestration ----------
 async def run_load(
     config: Config,
     rpm: int,
@@ -425,30 +411,23 @@ async def run_load(
     login_timeout: int,
     show_progress_every: int,
     stats_dir: Path,
-) -> None:
-    """
-    End-to-end coordinator.
-
-    Steps
-    -----
-    1) Login all users to separate sessions (for isolated cookies).
-    2) Launch N workers that consume jobs and make requests.
-    3) Start a producer that enqueues jobs at the chosen RPM.
-    4) Periodically print a progress table and append a row to progress CSV.
-    5) After the producer stops and queue drains, print/write final summary.
-    """
-    # Prepare output files
+    login_concurrency: int,
+    connector_limit: int,
+    connector_limit_per_host: int):
     stats_dir.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S")
     progress_csv = stats_dir / f"load_progress_{ts}.csv"
-    summary_csv = stats_dir / f"load_summary_{ts}.csv"
+    summary_csv  = stats_dir / f"load_summary_{ts}.csv"
 
     # ----- 1) Login phase
     print(f"[INFO] Logging in {len(config.users)} users…")
-    login_tasks = [
-        login_user(config.base_url, config.login_path, cred, insecure_tls, login_timeout)
-        for cred in config.users
-    ]
+    sem = asyncio.Semaphore(max(1, login_concurrency))
+
+    async def login_one(cred: UserCred):
+        async with sem:
+            return await login_user(config.base_url, config.login_path, cred, insecure_tls, login_timeout, connector_limit, connector_limit_per_host)
+
+    login_tasks = [login_one(cred) for cred in config.users]
     sessions = [s for s in await asyncio.gather(*login_tasks) if s is not None]
     if not sessions:
         print("[FATAL] No successful logins; aborting.")
@@ -458,10 +437,8 @@ async def run_load(
     # ----- 2) Worker pool
     stats = Stats(target_rpm=rpm)
     job_q: asyncio.Queue = asyncio.Queue(maxsize=rpm * 2 if rpm > 0 else 1000)
-    workers = [
-        asyncio.create_task(worker(f"W{i+1}", config.base_url, job_q, stats))
-        for i in range(concurrency)
-    ]
+    workers = [asyncio.create_task(worker(f"W{i+1}", config.base_url, job_q, stats)) for i in range(concurrency)]
+    prod = asyncio.create_task(producer(job_q, sessions, config.urls, config.parameters, rpm, duration_sec))
 
     # ----- 3) Producer
     prod = asyncio.create_task(
@@ -473,7 +450,7 @@ async def run_load(
         pw = csv.writer(pf)
         pw.writerow(_csv_header())
 
-        async def progress_loop() -> None:
+        async def progress():
             """
             Periodically print a table and append a progress row to CSV.
 
@@ -483,29 +460,13 @@ async def run_load(
                 await asyncio.sleep(show_progress_every)
                 snap = stats.snapshot()
                 now_iso = time.strftime("%Y-%m-%dT%H:%M:%S")
-
-                # Print readable table to terminal
-                headers = ["Metric", "Value"]
-                rows = [
-                    ("Elapsed (s)", snap["elapsed_sec"]),
-                    ("Target RPM", snap["target_rpm"]),
-                    ("Observed RPM", snap["observed_rpm"]),
-                    ("Total", snap["total"]),
-                    ("Success", snap["success"]),
-                    ("Failures", snap["failures"]),
-                    ("p50 (ms)", snap["latency_ms_p50"]),
-                    ("p95 (ms)", snap["latency_ms_p95"]),
-                    ("p99 (ms)", snap["latency_ms_p99"]),
-                ]
+                headers = ["Metric","Value"]
+                rows = [("Elapsed (s)", snap["elapsed_sec"]), ("Target RPM",  snap["target_rpm"]), ("Observed RPM",snap["observed_rpm"]), ("Total",       snap["total"]), ("Success",     snap["success"]), ("Failures",    snap["failures"]), ("p50 (ms)",    snap["latency_ms_p50"]), ("p95 (ms)",    snap["latency_ms_p95"]), ("p99 (ms)",    snap["latency_ms_p99"])]
                 print("\n[PROGRESS]\n" + _format_table(headers, rows))
-
-                # Append to CSV and flush so tail -f shows updates
                 pw.writerow(_csv_row(now_iso, snap))
                 pf.flush()
 
-        prog_task = asyncio.create_task(progress_loop())
-
-        # ----- 4) Wait for producer completion & queue drain
+        prog = asyncio.create_task(progress())
         await prod
         await job_q.join()
 
@@ -513,47 +474,29 @@ async def run_load(
         for _ in workers:
             await job_q.put((None, UrlTemplate(path="/"), {}))
         await asyncio.gather(*workers, return_exceptions=True)
+        prog.cancel()
 
-        # Stop the progress reporter
-        prog_task.cancel()
-
-    # Close sessions after the loop ends
     for s in sessions:
         await s.close()
 
-    # ----- 5) Final summary
     snap = stats.snapshot()
-    headers = ["Metric", "Value"]
-    rows = [
-        ("Elapsed (s)", snap["elapsed_sec"]),
-        ("Target RPM", snap["target_rpm"]),
-        ("Observed RPM", snap["observed_rpm"]),
-        ("Total", snap["total"]),
-        ("Success", snap["success"]),
-        ("Failures", snap["failures"]),
-        ("p50 (ms)", snap["latency_ms_p50"]),
-        ("p95 (ms)", snap["latency_ms_p95"]),
-        ("p99 (ms)", snap["latency_ms_p99"]),
-    ]
+    headers = ["Metric","Value"]
+    rows = [("Elapsed (s)", snap["elapsed_sec"]), ("Target RPM",  snap["target_rpm"]), ("Observed RPM",snap["observed_rpm"]), ("Total",       snap["total"]), ("Success",     snap["success"]), ("Failures",    snap["failures"]), ("p50 (ms)",    snap["latency_ms_p50"]), ("p95 (ms)",    snap["latency_ms_p95"]), ("p99 (ms)",    snap["latency_ms_p99"])]
     print("\n[RESULTS]\n" + _format_table(headers, rows))
-    print("\n[RESULTS JSON]\n" + json.dumps(snap, indent=2))
+    import json as _json
+    print("\n[RESULTS JSON]\n" + _json.dumps(snap, indent=2))
 
-    # Write final row to a separate summary CSV
     with summary_csv.open("w", encoding="utf-8", newline="") as sf:
         sw = csv.writer(sf)
         sw.writerow(_csv_header())
         sw.writerow(_csv_row(time.strftime("%Y-%m-%dT%H:%M:%S"), snap))
-
     print(f"[INFO] Progress CSV: {progress_csv}")
     print(f"[INFO] Summary  CSV: {summary_csv}")
 
 
 # ---------- CLI ----------
 def parse_args() -> argparse.Namespace:
-    """Define and parse CLI arguments."""
-    p = argparse.ArgumentParser(
-        description="Moodle LMS load generator (async) with table output & CSV capture"
-    )
+    p = argparse.ArgumentParser(description="Moodle LMS load generator (async) with throttled login & table/CSV output")
     p.add_argument("--config", required=True, help="Path to config.json")
     p.add_argument("--rpm", type=int, required=True, help="Requests per minute target")
     p.add_argument("--duration", type=int, required=True, help="Duration in seconds")
@@ -562,18 +505,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--login-timeout", type=int, default=20, help="Seconds for login HTTP timeout")
     p.add_argument("--progress", type=int, default=30, help="Progress print interval (seconds)")
     p.add_argument("--stats-dir", default="stats", help="Directory to write CSV stats (default: stats)")
+    p.add_argument("--login-concurrency", type=int, default=20, help="Max concurrent login attempts (default: 20)")
+    p.add_argument("--connector-limit", type=int, default=8, help="Max simultaneous connections per session (default: 8)")
+    p.add_argument("--connector-limit-per-host", type=int, default=4, help="Max per-host connections per session (default: 4)")
     return p.parse_args()
 
 
 def load_config(path: str) -> Config:
-    """Load config JSON from disk and return a Config object."""
+    """
+    Load config JSON from disk and return a Config object.
+    """
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     return Config.from_dict(data)
 
 
 if __name__ == "__main__":
-    # Surface a clearer error if aiohttp is missing
     try:
         import aiohttp  # noqa: F401
     except Exception:
@@ -592,5 +539,8 @@ if __name__ == "__main__":
             login_timeout=args.login_timeout,
             show_progress_every=args.progress,
             stats_dir=Path(args.stats_dir),
+            login_concurrency=args.login_concurrency,
+            connector_limit=args.connector_limit,
+            connector_limit_per_host=args.connector_limit_per_host,
         )
     )

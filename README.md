@@ -43,7 +43,8 @@ deactivate
 
 ### Step 1: Seed test data
 Moodle LMS has an inbuilt tool to generate test data.    
-This creates a site with a realistic number of users, courses, and activities.
+This creates a site with a realistic number of users, courses, and activities.   
+Use this script to generate a site of a given size for load testing.
 
 Example: On webserver directly:
 ```bash
@@ -55,21 +56,7 @@ Example: Docker based webserver:
 ./bin/moodle-docker-compose exec webserver php public/admin/tool/generator/cli/maketestsite.php --size=M
 ```
 
-### Step 2: Reset passwords and update config
-The site generator creates users with random passwords.   
-To allow the load testing script to log in, we need to reset a number of user passwords to a known value and update `config.json` with the usernames.
-
-```bash
-python set_moodle_passwords.py \
-  --db-name moodle \
-  --db-user moodleuser \
-  --db-pass S3cret \
-  --db-host localhost \
-  --count 200 \
-  --password Passw0rd! \
-  --config config.json
-```
-### Step 3 (OPTIONAL): Add extra enrolments)
+### Step 2 (OPTIONAL): Add extra enrolments)
 The site generator creates a number of users and courses, but not all users are enrolled in many courses. Also, all users are enrolled as students only, there are no teachers.   
 If you generated the site with a medium size (`--size=M`), 1,000 users would have been created along with 72 courses.
 This repository contains a `users.csv` file that can be optionally used to increase user enrolments.  
@@ -92,8 +79,30 @@ Example: Docker based webserver:
 ./bin/moodle-docker-compose exec webserver php admin/tool/uploaduser/cli/uploaduser.php —file=/var/www/html/Users.csv --uutype=3
 ```
 
+### Step 3: Reset passwords and update config
+The site generator creates users with random passwords.   
+To allow the load testing script to log in, we need to reset a number of user passwords to a known value and update `config.json` with the usernames.
+Use the `set_moodle_passwords.py` script to do this:
+
+```bash
+python set_moodle_passwords.py \
+  --db-name moodle \
+  --db-user moodleuser \
+  --db-pass S3cret \
+  --db-host 127.0.0.1 \
+  --db-port 5433 \
+  --prefix m_ \
+  --count 1000 \
+  --password Passw0rd! \
+  --config config.json
+```
+
 ### Step 4: Backup the database (pre-test snapshot)
-Create a **custom-format** dump so restores are fast and portable:
+In order to get consistent results between test runs, it's important to reset the database to a known state before each run.    
+Use `pg_dump` to create a snapshot of the database after seeding and password reset so restores are fast and portable. 
+
+To use `pg_dump`, you will need to have the Postgres client tools installed.   
+The following example creates a custom-format dump file without ownership or privilege commands, which is suitable for use with the `restore_moodle_db.py` script.
 
 ```bash
 pg_dump -U moodle \
@@ -136,8 +145,7 @@ python moodle_load.py \
     --rpm 600 \
     --duration 600 \
     --concurrency 30 \
-    --stats-dir stats \
-    --insecure
+    --stats-dir stats
 ```
 
 ### Output example
@@ -306,6 +314,21 @@ python restore_moodle_db.py \
 - Drop in observed RPM → request throttling or slow PHP execution  
 
 ---
+
+### (Optional) Raise OS open-file limit temporarily
+
+If you see `Too many open files` during heavy tests, increase the per-process
+file descriptor limit **for the current shell** before running the load script:
+
+**Linux/macOS (temporary for this shell):**
+```bash
+ulimit -n 65535
+```
+
+> Keep connector limits modest and throttle logins (defaults are safe).
+> For large runs, try: `--login-concurrency 20 --connector-limit 8 --connector-limit-per-host 4`.
+
+**Where to insert this in README:** place this section **immediately after the `## Setup` section**, so it’s seen before running the tools.
 
 ## Requirements
 
