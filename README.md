@@ -254,6 +254,40 @@ python restore_moodle_db.py \
 
 ---
 
+## Connection and Concurrency Controls
+
+To prevent overloading your test system or the Moodle server, you can fine-tune how connections and logins are handled.
+
+### `--login-concurrency`
+- **Purpose:** Limits how many users attempt to log in simultaneously.  
+- **Default:** `20`  
+- **Effect:** Reduces initial load on the web server and DB during the login phase.
+
+### `--connector-limit` and `--connector-limit-per-host`
+- **Purpose:** Control how many network connections each simulated user can open at once.  
+- **Defaults:** `8` (total) and `4` (per host)  
+- **Effect:** Prevents socket exhaustion and “Too many open files” errors.
+
+### Example usage
+```bash
+python moodle_load.py \
+  --config config.json \
+  --rpm 600 \
+  --duration 600 \
+  --concurrency 30 \
+  --login-concurrency 20 \
+  --connector-limit 8 \
+  --connector-limit-per-host 4
+```
+
+| Setting | Prevents | Typical safe value |
+|----------|-----------|--------------------|
+| `--login-concurrency` | Login storm (server overload at start) | 20 |
+| `--connector-limit` | File descriptor exhaustion (too many sockets) | 8 |
+| `--connector-limit-per-host` | Too many connections to one host | 4 |
+
+---
+
 ## Combined Test Workflow (Recommended)
 
 Run both load generation and Docker monitoring in parallel; reset DB between runs using the restore script.
@@ -325,10 +359,10 @@ file descriptor limit **for the current shell** before running the load script:
 ulimit -n 65535
 ```
 
-> Keep connector limits modest and throttle logins (defaults are safe).
+> Keep connector limits modest and throttle logins (defaults are safe).  
 > For large runs, try: `--login-concurrency 20 --connector-limit 8 --connector-limit-per-host 4`.
 
-**Where to insert this in README:** place this section **immediately after the `## Setup` section**, so it’s seen before running the tools.
+---
 
 ## Requirements
 
