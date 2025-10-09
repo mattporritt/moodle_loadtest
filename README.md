@@ -11,19 +11,20 @@ Includes:
 
 ## Repository Contents
 
-| File | Description |
-|------|--------------|
-| **`moodle_load.py`** | Async load generator — logs in users, hits URLs, prints tables, writes CSV. |
-| **`set_moodle_passwords.py`** | Resets test user passwords (Postgres) and populates `config.json`. |
-| **`capture_docker_stats.py`** | Captures Docker CPU/mem/net I/O with live table and CSV output. |
+| File | Description                                                                                    |
+|------|------------------------------------------------------------------------------------------------|
+| **`moodle_load.py`** | Async load generator, logs in users, hits URLs, prints tables, writes CSV.                     |
+| **`set_moodle_passwords.py`** | Resets test user passwords (Postgres) and populates `config.json`.                             |
+| **`capture_docker_stats.py`** | Captures Docker CPU/mem/net I/O with live table and CSV output.                                |
 | **`restore_moodle_db.py`** | **New:** Restores the Moodle Postgres DB from a `pg_dump -F c` snapshot (clean or drop modes). |
-| **`requirements.txt`** | Python dependencies. |
+| **`requirements.txt`** | Python dependencies.                                                                           |
 
 ---
 
 ## Setup
 
 ### 1. Create and activate your environment
+Once cloning the code, you'll need to activate the Python virtual environment and install dependencies:
 
 ```bash
 python -m venv .venv
@@ -41,6 +42,8 @@ deactivate
 ## Preparing the Moodle Test Site
 
 ### Step 1: Seed test data
+Moodle LMS has an inbuilt tool to generate test data.    
+This creates a site with a realistic number of users, courses, and activities.
 
 Example: On webserver directly:
 ```bash
@@ -53,6 +56,8 @@ Example: Docker based webserver:
 ```
 
 ### Step 2: Reset passwords and update config
+The site generator creates users with random passwords.   
+To allow the load testing script to log in, we need to reset a number of user passwords to a known value and update `config.json` with the usernames.
 
 ```bash
 python set_moodle_passwords.py \
@@ -64,9 +69,30 @@ python set_moodle_passwords.py \
   --password Passw0rd! \
   --config config.json
 ```
+### Step 3 (OPTIONAL): Add extra enrolments)
+The site generator creates a number of users and courses, but not all users are enrolled in many courses. Also, all users are enrolled as students only, there are no teachers.   
+If you generated the site with a medium size (`--size=M`), 1,000 users would have been created along with 72 courses.
+This repository contains a `users.csv` file that can be optionally used to increase user enrolments.  
+The following commands will enrol all users in all courses, mostly as students. There will be 10 courses where users are enrolled as teachers.   
 
-### Step 3: Backup the database (pre-test snapshot)
+**NOTE:** The `users.csv` file will need to be accessible to the webserver, so if using Docker, copy it to the webserver container first.   
+For example:
+```bash
+cp -v ~/moodle_loadtest/users.csv ./
+```
 
+Use the Moodle LMS commandline tool to process the CSV and enrol users.   
+On webserver directly:
+```bash
+php admin/tool/uploaduser/cli/uploaduser.php —file=/var/www/html/Users.csv --uutype=3
+```
+
+Example: Docker based webserver:
+```bash
+./bin/moodle-docker-compose exec webserver php admin/tool/uploaduser/cli/uploaduser.php —file=/var/www/html/Users.csv --uutype=3
+```
+
+### Step 4: Backup the database (pre-test snapshot)
 Create a **custom-format** dump so restores are fast and portable:
 
 ```bash
