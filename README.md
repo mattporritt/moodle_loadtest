@@ -117,6 +117,11 @@ pg_dump -U moodle \
 
 ## Load Test Configuration (`config.json`)
 
+The `config.json` file defines how the load test behaves including which users are used, which URLs are requested, and how URL parameters are randomized.  
+Each section influences a different aspect of the test flow.
+
+### Structure
+
 ```json
 {
   "base_url": "https://moodle.test",
@@ -135,9 +140,28 @@ pg_dump -U moodle \
 }
 ```
 
+### Configuration keys
+
+| Key | Description | Example |
+|-----|--------------|----------|
+| **`base_url`** | The root URL of your Moodle instance. All other paths are appended to this value. | `https://moodle.test` |
+| **`login_path`** | The path (relative to base URL) used for user login. The script will post credentials to this URL to establish sessions. | `/login/index.php` |
+| **`users`** | A list of username/password pairs used for load testing. Each user logs in once and keeps its session cookie active throughout the test. | `{ "username": "perfuser01", "password": "Passw0rd!" }` |
+| **`parameters`** | Optional dynamic ranges that define how placeholders in URLs are replaced at runtime. Each `{parameter}` in the `urls` list corresponds to a key here. | `"courseid": { "min": 2, "max": 500 }` |
+| **`urls`** | The list of relative paths to request repeatedly. Each path can include dynamic parameters surrounded by `{}` that are randomly chosen each request. | `"/course/view.php?id={courseid}"` |
+
+### Example behavior
+
+In the above configuration:
+- Each user logs in at `https://moodle.test/login/index.php`.
+- The script will visit `/my/` and `/course/view.php?id=N` where `N` is a random integer between 2 and 500.
+- If multiple users are defined, requests are distributed randomly among them to simulate concurrent user load.
+
 ---
 
 ## Running the Load Test
+
+Once your config is prepared, execute:
 
 ```bash
 python moodle_load.py \
@@ -147,6 +171,16 @@ python moodle_load.py \
     --concurrency 30 \
     --stats-dir stats
 ```
+
+### Argument summary
+
+| Flag | Description |
+|------|--------------|
+| `--config` | Path to the configuration file. |
+| `--rpm` | Target requests per minute across all users. |
+| `--duration` | Total duration of the test (seconds). |
+| `--concurrency` | Number of concurrent async workers generating requests. |
+| `--stats-dir` | Directory where progress and summary CSVs are written. |
 
 ### Output example
 
@@ -165,15 +199,32 @@ p95 (ms)       | 350
 p99 (ms)       | 590
 ```
 
+### Output explained
+
+| Metric | Meaning |
+|---------|----------|
+| **Elapsed (s)** | How long the test has been running in seconds. |
+| **Target RPM** | The intended global request rate. |
+| **Observed RPM** | Actual measured requests per minute based on timing. |
+| **Total** | Total requests attempted so far. |
+| **Success / Failures** | Count of successful (HTTP 2xx–3xx) and failed (4xx–5xx or exceptions) requests. |
+| **p50 / p95 / p99 (ms)** | Percentile latencies in milliseconds — e.g. 95% of requests finished faster than `p95`. |
+
 At completion, a final table and JSON summary are printed and CSVs are written to:
 ```
 stats/load_progress_<timestamp>.csv
 stats/load_summary_<timestamp>.csv
 ```
+- `load_progress_*.csv`: periodic snapshots during the test (every progress interval).  
+- `load_summary_*.csv`: final one-line summary at the end of the run.
+
+These files make it easy to graph trends and compare versions when using `git bisect`.
 
 ---
 
 ## Monitoring Docker Containers
+
+To correlate system resource usage with Moodle performance, run:
 
 ```bash
 python capture_docker_stats.py \
@@ -196,11 +247,27 @@ moodlemaster-webserver-1 | 42.3% | 450.00 MiB/2.00 GiB |  18  | rx 10.2 MiB tx 7
 moodlemaster-db-1        | 66.7% | 930.00 MiB/2.00 GiB |  15  | rx 2.2 MiB tx 1.7 MiB   | r 320 MiB w 75 MiB
 ```
 
+### Column meanings
+
+| Column | Description |
+|---------|--------------|
+| **Container** | The Docker container name being monitored. |
+| **CPU%** | Instantaneous CPU usage percentage for that container. |
+| **Memory (used/limit)** | Current memory consumption relative to its assigned memory limit. |
+| **PIDs** | Number of active processes within the container. |
+| Net (rx/tx) | Cumulative network bytes received (rx) and transmitted (tx) since monitoring began, shown in human-readable units (KiB, MiB, GiB). |
+| Block I/O (r/w) | Cumulative disk bytes read (r) and written (w) since monitoring began, in human-readable units (KiB, MiB, GiB). |
+
 ### Files written
+
+For each container, a CSV is written:
+
 ```
-stats/moodlemaster-webserver-1_<timestamp>_<tag>.csv
-stats/moodlemaster-db-1_<timestamp>_<tag>.csv
+stats/<container>_<timestamp>_<tag>.csv
 ```
+
+Each row represents one polling interval (default 1 second) and includes all the above metrics.  
+These CSVs can be imported into a spreadsheet or plotted in a dashboard to visualize trends.
 
 ---
 
