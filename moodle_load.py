@@ -14,18 +14,47 @@ import asyncio
 import csv
 import json
 import random
-import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
+import re
+from urllib.parse import urljoin, urlparse
 import aiohttp
 from aiohttp import ClientSession, TCPConnector
 
 # Regex to extract Moodle's hidden login token from the login form
 LOGIN_TOKEN_RE = re.compile(r'name="logintoken"\s+value="([^"]+)"')
+LOGIN_PATH = "/login/index.php"
+DASHBOARD_PATH = "/my/"
 
+_LOGINTOKEN_RE = re.compile(r'name="logintoken"\s+value="([^"]+)"')
+_INVALID_LOGIN_RE = re.compile(r"\bInvalid login\b", re.IGNORECASE)
+
+def _is_login_url(url: str) -> bool:
+    try:
+        path = urlparse(url).path or ""
+        return path.rstrip("/").endswith(LOGIN_PATH.rstrip("/"))
+    except Exception:
+        return False
+
+async def _fetch_logintoken(session: aiohttp.ClientSession, base_url: str) -> str | None:
+    login_url = urljoin(base_url, LOGIN_PATH)
+    async with session.get(login_url, allow_redirects=True) as r:
+        html = await r.text()
+    m = _LOGINTOKEN_RE.search(html)
+    return m.group(1) if m else None
+
+async def _probe_logged_in(session: aiohttp.ClientSession, base_url: str) -> bool:
+    """Hit /my/ and check if we get bounced to login."""
+    dash = urljoin(base_url, DASHBOARD_PATH)
+    async with session.get(dash, allow_redirects=True) as r:
+        final_url = str(r.url)
+        body = await r.text()
+    if _is_login_url(final_url):
+        return False
+    # A light sanity check that often appears only when logged in.
+    return ("logout.php" in body) or (not _is_login_url(final_url))
 
 # ---------- Pretty table helpers ----------
 def _format_table(headers: List[str], rows: List[Tuple[Any, Any]]) -> str:
@@ -228,66 +257,82 @@ async def fetch_logintoken(session: ClientSession, login_url: str) -> Optional[s
 
 
 async def login_user(
+    session: aiohttp.ClientSession,
     base_url: str,
-    login_path: str,
+    username: str,
+    password: str,
+) -> bool:
+    """
+    Returns True iff Moodle login succeeded.
+    Strategy:
+      1) GET login page, parse logintoken
+      2) POST creds + token, follow redirects
+      3) Fail if we land back on /login/ or see 'Invalid login'
+      4) Probe /my/ to be resilient to custom landings
+    """
+    # Step 1: fetch token (present on stock Moodle)
+    logintoken = await _fetch_logintoken(session, base_url)
+
+    # Step 2: POST credentials and follow redirects
+    form = {
+        "username": username,
+        "password": password,
+        "rememberusername": 1,
+    }
+    if logintoken:
+        form["logintoken"] = logintoken
+
+    login_url = urljoin(base_url, LOGIN_PATH)
+    async with session.post(login_url, data=form, allow_redirects=True) as r:
+        final_url = str(r.url)
+        # Take a bounded slice; avoids huge memory on error pages under load
+        body = (await r.text())[:200_000]
+
+    # Step 3: primary failure signals
+    if _is_login_url(final_url):
+        return False
+    if _INVALID_LOGIN_RE.search(body):
+        return False
+
+    # Step 4: cheap confirmation probe (handles front page/custom redirects)
+    return await _probe_logged_in(session, base_url)
+
+
+# NEW: wrapper that matches the 7-arg call site and returns a logged-in session
+async def login_and_return_session(
+    base_url: str,
+    login_path: str,  # kept for signature compatibility; not needed by login_user
     cred: UserCred,
     insecure_tls: bool,
-    timeout: int = 20,
-    connector_limit: int = 8,
-    connector_limit_per_host: int = 4,
-) -> Optional[ClientSession]:
+    login_timeout: int,
+    connector_limit: int,
+    connector_limit_per_host: int,
+) -> Optional[aiohttp.ClientSession]:
     """
-    Create a dedicated session per user and attempt login.
-
-    Logic
-    -----
-    - Request login page → parse logintoken
-    - POST credentials (+ token if present)
-    - Consider login successful if:
-        * HTTP status is 200/302/303, and
-        * a 'MoodleSession*' cookie is set
-    - If login fails, close the session to free sockets.
+    Create a session, attempt Moodle login using `login_user`, and return the
+    authenticated session on success; otherwise, close and return None.
     """
+    timeout = aiohttp.ClientTimeout(total=login_timeout)
     connector = TCPConnector(
+        limit=connector_limit,
+        limit_per_host=connector_limit_per_host,
         ssl=False if insecure_tls else None,
-        limit=max(1, connector_limit),
-        limit_per_host=max(1, connector_limit_per_host),
-        ttl_dns_cache=300,
-        enable_cleanup_closed=True,
     )
-    session = ClientSession(
-        connector=connector,
-        timeout=aiohttp.ClientTimeout(total=timeout),
-        headers={"User-Agent": "moodle-loadgen/1.3"},
-        cookie_jar=aiohttp.CookieJar(unsafe=insecure_tls),
-    )
+    jar = aiohttp.CookieJar()
+    session = aiohttp.ClientSession(timeout=timeout, connector=connector, cookie_jar=jar)
+
     try:
-        login_url = f"{base_url}{login_path}"
-        token = await fetch_logintoken(session, login_url)
-        if not token:
-            # Non-fatal: some themes/flows don't include tokens.
-            print(f"[WARN] No logintoken for {cred.username}; attempting login anyway.")
-
-        payload = {"username": cred.username, "password": cred.password, "anchor": ""}
-        if token:
-            payload["logintoken"] = token
-
-        async with session.post(login_url, data=payload, allow_redirects=True) as resp:
-            ok_cookie = any(c.key.lower().startswith("moodlesession") for c in session.cookie_jar)
-            ok_status = resp.status in (200, 302, 303)
-            if ok_cookie and ok_status:
-                return session
-            else:
-                text = await resp.text()
-                if "loginerrormessage" in text or "Invalid login" in text:
-                    print(f"[ERROR] Login failed for {cred.username}: invalid credentials.")
-                else:
-                    print(f"[ERROR] Login maybe failed for {cred.username}: status {resp.status}")
-                await session.close()
-                return None
-    except Exception as e:
-        print(f"[ERROR] Login exception for {cred.username}: {e}")
+        ok = await login_user(session, base_url, cred.username, cred.password)
+        if ok:
+            return session
         await session.close()
+        return None
+    except Exception as e:
+        try:
+            await session.close()
+        finally:
+            pass
+        print(f"[LOGIN] {cred.username}: exception during login: {e}")
         return None
 
 
@@ -425,7 +470,15 @@ async def run_load(
 
     async def login_one(cred: UserCred):
         async with sem:
-            return await login_user(config.base_url, config.login_path, cred, insecure_tls, login_timeout, connector_limit, connector_limit_per_host)
+            return await login_and_return_session(
+                config.base_url,
+                config.login_path,
+                cred,
+                insecure_tls,
+                login_timeout,
+                connector_limit,
+                connector_limit_per_host,
+            )
 
     login_tasks = [login_one(cred) for cred in config.users]
     sessions = [s for s in await asyncio.gather(*login_tasks) if s is not None]
@@ -438,12 +491,9 @@ async def run_load(
     stats = Stats(target_rpm=rpm)
     job_q: asyncio.Queue = asyncio.Queue(maxsize=rpm * 2 if rpm > 0 else 1000)
     workers = [asyncio.create_task(worker(f"W{i+1}", config.base_url, job_q, stats)) for i in range(concurrency)]
-    prod = asyncio.create_task(producer(job_q, sessions, config.urls, config.parameters, rpm, duration_sec))
 
     # ----- 3) Producer
-    prod = asyncio.create_task(
-        producer(job_q, sessions, config.urls, config.parameters, rpm, duration_sec)
-    )
+    prod = asyncio.create_task(producer(job_q, sessions, config.urls, config.parameters, rpm, duration_sec))
 
     # Open CSV for periodic progress capture
     with progress_csv.open("w", encoding="utf-8", newline="") as pf:
