@@ -6,29 +6,31 @@ Async load generator for Moodle LMS with:
 - throttled login to avoid DOSing the server,
 - bounded socket usage per session,
 - human-readable progress tables and CSV capture,
-- separate error log for failed requests.
+- separate error log for failed requests,
+- optional "browser emulation" to fetch assets and make lightweight AJAX probes.
 
 Notes
 -----
-* This script intentionally avoids dependencies beyond `aiohttp` for portability.
 * Latency percentiles (p50/p95/p99) are computed **only from successful requests**.
   Failures are still counted in throughput and are also recorded in `errors_*.csv`.
+* In browser emulation mode, we count **each sub-request** (assets/AJAX) as its own
+  request for success/failure and timing, not just the top-level page load.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import csv
 import json
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-import re
-from urllib.parse import urljoin, urlparse
-import contextlib
-
+from typing import Any, Dict, List, Optional, Tuple, Iterable, Set
+from urllib.parse import urljoin, urlparse, urlunparse
+from html import unescape
 import aiohttp
 from aiohttp import ClientSession, TCPConnector
 
@@ -36,16 +38,31 @@ from aiohttp import ClientSession, TCPConnector
 # Constants & Regex
 # ---------------------------------------------------------------------------
 
-# Moodle login endpoints used to determine success/failure.
 LOGIN_PATH: str = "/login/index.php"
 DASHBOARD_PATH: str = "/my/"
 
 # Hidden CSRF field on the login form.
 _LOGINTOKEN_RE = re.compile(r'name="logintoken"\s+value="([^"]+)"')
 # Locale-specific message for bad credentials on stock Moodle (English).
-# If your site uses a different language, consider making this configurable
-# or matching on the string identifier in the template instead.
 _INVALID_LOGIN_RE = re.compile(r"\bInvalid login\b", re.IGNORECASE)
+
+# Extract candidate asset URLs (href/src) from HTML.
+_HREF_SRC_RE = re.compile(
+    r'''(?ix)
+    \b(?:href|src)\s*=\s*  # attribute
+    (?:
+        "([^"]+)"             # double-quoted
+        |'([^']+)'            # single-quoted
+        |([^\s>]+)           # unquoted (rare)
+    )
+    '''
+)
+# Commonly, sesskey shows up in config blobs or query strings.
+_SESSKEY_RE = re.compile(r'\bsesskey\b[\s:=]+"?([A-Za-z0-9]+)"?', re.IGNORECASE)
+_SESSKEY_QS_RE = re.compile(r'\bsesskey=([A-Za-z0-9]+)\b', re.IGNORECASE)
+
+# Lightweight, harmless AJAX probe payload (keeps session warm).
+_AJAX_TOUCH_PAYLOAD = [{"methodname": "core_session_touch", "args": {}}]
 
 # ---------------------------------------------------------------------------
 # URL / HTML utilities
@@ -71,7 +88,6 @@ def _is_login_url(url: str) -> bool:
         # Be conservative; if we fail to parse, we can't assert it's *not* login.
         return False
 
-
 async def _fetch_logintoken(session: aiohttp.ClientSession, base_url: str) -> Optional[str]:
     """
     Retrieve the login page and extract Moodle's hidden 'logintoken'.
@@ -93,7 +109,6 @@ async def _fetch_logintoken(session: aiohttp.ClientSession, base_url: str) -> Op
         html = await r.text()
     m = _LOGINTOKEN_RE.search(html)
     return m.group(1) if m else None
-
 
 async def _probe_logged_in(session: aiohttp.ClientSession, base_url: str) -> bool:
     """
@@ -128,6 +143,85 @@ async def _probe_logged_in(session: aiohttp.ClientSession, base_url: str) -> boo
     # when logged-in, Moodle pages often include a logout link.
     return ("logout.php" in body) or (not _is_login_url(final_url))
 
+def _same_origin(url_a: str, url_b: str) -> bool:
+    """Return True if `url_a` and `url_b` share scheme+netloc (origin)."""
+    pa, pb = urlparse(url_a), urlparse(url_b)
+    return (pa.scheme, pa.netloc) == (pb.scheme, pb.netloc)
+
+def _normalize_asset_url(base_url: str, raw: str) -> Optional[str]:
+    """
+    Resolve `raw` relative to base and discard javascript:, mailto:, data:, tel:, and fragments.
+    Also HTML-unescape and normalize backslash-escaped slashes so strings like
+    '\\/\\/en.wikipedia.org\\/wiki\\/X' are handled correctly.
+
+    This function also treats protocol-relative URLs (//host/path) properly and
+    skips any URL that still contains quotes or obvious garbage after cleanup.
+    """
+    if not raw:
+        return None
+
+    # 1) Decode HTML entities and trim whitespace
+    raw = unescape(raw).strip()
+
+    # 2) Strip wrapping quotes if present
+    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+        raw = raw[1:-1].strip()
+
+    # 3) Normalize common escape sequences from inline JSON/JS
+    #    e.g. 'https:\\/\\/example.com\\/x' -> 'https://example.com/x'
+    raw = raw.replace(r"\/", "/").replace(r"\'", "'").replace(r"\\#", "#").replace(r"\\:", ":")
+
+    # 4) Drop schemes/targets we never want to fetch
+    if raw.startswith(("#", "javascript:", "data:", "mailto:", "tel:")):
+        return None
+
+    # 5) Handle protocol-relative and "almost protocol-relative" (e.g. '/\/\/host/path')
+    #    After step 3, things like '\\/\\/host' are now '//host'.
+    scheme = urlparse(base_url).scheme or "https"
+    stripped = raw.lstrip("/")  # remove leading slashes to detect '//host'
+    if stripped.startswith("//"):
+        # true (or almost-true) protocol-relative URL
+        u = f"{scheme}://{stripped.lstrip('/')}"
+    elif raw.startswith(("http://", "https://")):
+        u = raw
+    else:
+        # relative URL – resolve against base
+        u = urljoin(base_url + "/", raw)
+
+    # 6) Defensive: drop URLs with quotes or remaining HTML entities
+    if any(q in u for q in ['"', "'", "&quot;"]):
+        return None
+
+    return u
+
+def extract_asset_urls(html: str, base_url: str, exclude_re: Optional[re.Pattern], same_origin_only: bool = True) -> List[str]:
+    """Extract candidate asset URLs from HTML content."""
+    urls: List[str] = []
+    seen: Set[str] = set()
+
+    for m in _HREF_SRC_RE.finditer(html):
+        raw = m.group(1) or m.group(2) or m.group(3)
+        u = _normalize_asset_url(base_url, raw)
+        if not u:
+            continue
+
+        # Apply same-origin filter AFTER normalization so externals (wikipedia/creativecommons)
+        # remain external and are skipped when same_origin_only=True.
+        if same_origin_only and not _same_origin(base_url, u):
+            continue
+
+        if exclude_re and exclude_re.search(u):
+            continue
+
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+    return urls
+
+def maybe_extract_sesskey(html: str) -> Optional[str]:
+    """Attempt to extract Moodle sesskey from HTML blobs or query strings."""
+    m = _SESSKEY_RE.search(html) or _SESSKEY_QS_RE.search(html)
+    return m.group(1) if m else None
 
 # ---------------------------------------------------------------------------
 # Pretty table
@@ -159,7 +253,6 @@ def _format_table(headers: List[str], rows: List[Tuple[Any, Any]]) -> str:
 
     # Separator mirrors column widths (+2 for padding around each cell)
     sep = "+".join("-" * (w + 2) for w in widths)
-
     lines = []
     header_line = " | ".join(str(h).ljust(widths[i]) for i, h in enumerate(headers))
     lines.append(header_line)
@@ -168,7 +261,6 @@ def _format_table(headers: List[str], rows: List[Tuple[Any, Any]]) -> str:
         line = " | ".join(str(row[i]).ljust(widths[i]) for i in range(cols))
         lines.append(line)
     return "\n".join(lines)
-
 
 # ---------------------------------------------------------------------------
 # Data models / config
@@ -180,7 +272,6 @@ class UserCred:
     """
     username: str
     password: str
-
 
 @dataclass
 class UrlTemplate:
@@ -255,7 +346,9 @@ class Config:
             parameters=parameters,
         )
 
-
+# ---------------------------------------------------------------------------
+# Stats aggregation
+# ---------------------------------------------------------------------------
 @dataclass
 class Stats:
     """
@@ -272,7 +365,7 @@ class Stats:
     success: int = 0
     failures: int = 0
     latencies: List[float] = field(default_factory=list)
-    target_rpm: int = 0
+    target_rpm: int = 0  # interpreted as "initiated requests per minute"
 
     def record(self, ok: bool, latency: float) -> None:
         """
@@ -307,7 +400,7 @@ class Stats:
         p50, p95, p99 = self._percentiles([50, 95, 99])
         return {
             "elapsed_sec": round(elapsed, 1),
-            "target_rpm": self.target_rpm,
+            "target_initiated_rpm": self.target_rpm,  # renamed for clarity
             "observed_rpm": round(rpm, 1),
             "total": self.total_requests,
             "success": self.success,
@@ -341,7 +434,9 @@ class Stats:
             out.append(int(xs[k] * 1000))
         return tuple(out)  # type: ignore[return-value]
 
-
+# ---------------------------------------------------------------------------
+# Core helpers
+# ---------------------------------------------------------------------------
 def render_path(tpl: str, parameters: Dict[str, ParamRange]) -> str:
     """
     Resolve integer placeholders inside a URL template using configured ranges.
@@ -370,101 +465,41 @@ def render_path(tpl: str, parameters: Dict[str, ParamRange]) -> str:
         return str(random.randint(pr.min, pr.max))
     return re.sub(r"\{([a-zA-Z0-9_]+)\}", repl, tpl)
 
-
 async def login_user(
     session: aiohttp.ClientSession,
     base_url: str,
     username: str,
     password: str,
 ) -> bool:
-    """
-    Attempt a Moodle username/password login using the given session.
-
-    Strategy
-    --------
-    1) GET login page, parse hidden `logintoken`.
-    2) POST creds + token; follow redirects.
-    3) Decide failure if we land back on /login/ or body contains 'Invalid login'.
-    4) Probe /my/ as a confirmation to withstand custom post-login redirects.
-
-    Parameters
-    ----------
-    session : aiohttp.ClientSession
-        Session to use for HTTP calls (cookies persist here).
-    base_url : str
-        Base site URL (e.g., 'https://moodle.example.com').
-    username : str
-        Username to authenticate.
-    password : str
-        Password to authenticate.
-
-    Returns
-    -------
-    bool
-        True iff login appears successful.
-    """
-    # Step 1: fetch token (present on stock Moodle)
+    # Step 1: fetch token
     logintoken = await _fetch_logintoken(session, base_url)
-
-    # Step 2: POST credentials and follow redirects
-    form: Dict[str, Any] = {
-        "username": username,
-        "password": password,
-        "rememberusername": 1,
-    }
+    # Step 2: post creds
+    form: Dict[str, Any] = {"username": username, "password": password, "rememberusername": 1}
     if logintoken:
         form["logintoken"] = logintoken
-
     login_url = urljoin(base_url, LOGIN_PATH)
     async with session.post(login_url, data=form, allow_redirects=True) as r:
         final_url = str(r.url)
-        # Take a bounded slice; avoids huge memory on error pages under load.
         body = (await r.text())[:200_000]
-
-    # Step 3: primary failure signals
     if _is_login_url(final_url):
         return False
     if _INVALID_LOGIN_RE.search(body):
         return False
-
-    # Step 4: cheap confirmation probe (handles front page/custom redirects)
+    # Store sesskey if we can scrape one during login; helpful for later.
+    sk = maybe_extract_sesskey(body)
+    if sk:
+        setattr(session, "sesskey", sk)
     return await _probe_logged_in(session, base_url)
-
 
 async def login_and_return_session(
     base_url: str,
-    login_path: str,  # kept for signature compatibility; not used directly
+    login_path: str,  # present for compatibility with existing calls
     cred: UserCred,
     insecure_tls: bool,
     login_timeout: int,
     connector_limit: int,
     connector_limit_per_host: int,
 ) -> Optional[aiohttp.ClientSession]:
-    """
-    Create a session, attempt Moodle login via `login_user`, and return it if authenticated.
-
-    Parameters
-    ----------
-    base_url : str
-        Base site URL (no trailing slash).
-    login_path : str
-        Unused here; present to match existing call sites.
-    cred : UserCred
-        Credentials object with username and password.
-    insecure_tls : bool
-        If True, disable TLS verification for self-signed/local setups.
-    login_timeout : int
-        Total timeout in seconds for the login HTTP operations.
-    connector_limit : int
-        Maximum simultaneous connections for the session connector.
-    connector_limit_per_host : int
-        Per-host limit for the session connector.
-
-    Returns
-    -------
-    Optional[aiohttp.ClientSession]
-        A logged-in session on success; None on failure or exception.
-    """
     timeout = aiohttp.ClientTimeout(total=login_timeout)
     connector = TCPConnector(
         limit=connector_limit,
@@ -473,21 +508,92 @@ async def login_and_return_session(
     )
     jar = aiohttp.CookieJar()
     session = aiohttp.ClientSession(timeout=timeout, connector=connector, cookie_jar=jar)
-
     try:
         ok = await login_user(session, base_url, cred.username, cred.password)
         if ok:
-            setattr(session, "username", cred.username)
+            setattr(session, "username", cred.username)  # used for error logging
             return session
         await session.close()
         return None
     except Exception as e:
-        # Network/parse error during login - tidy up the session.
         with contextlib.suppress(Exception):
             await session.close()
         print(f"[LOGIN] {cred.username}: exception during login: {e}")
         return None
 
+# ---------------------------------------------------------------------------
+# Worker & producer
+# ---------------------------------------------------------------------------
+async def _fetch_one(
+    session: ClientSession,
+    url: str,
+    stats: Stats,
+    name: str,
+    errors_writer: Optional[csv.writer],
+    errors_lock: Optional[asyncio.Lock],
+) -> None:
+    """Fetch a single URL, record timing, and log a failure if needed."""
+    t0 = time.monotonic()
+    ok = False
+    status: Optional[int] = None
+    error_msg = ""
+    try:
+        async with session.get(url, allow_redirects=True) as resp:
+            status = resp.status
+            ok = 200 <= resp.status < 400
+            await resp.read()
+    except Exception as e:
+        ok = False
+        error_msg = str(e)
+
+    dt = time.monotonic() - t0
+    stats.record(ok, dt)
+
+    if not ok and errors_writer and errors_lock:
+        async with errors_lock:
+            errors_writer.writerow([
+                time.strftime("%Y-%m-%dT%H:%M:%S"),
+                name,
+                getattr(session, "username", "unknown"),
+                url,
+                status if status is not None else "",
+                error_msg,
+            ])
+
+async def _ajax_touch(session: ClientSession, base_url: str, stats: Stats, name: str,
+                      errors_writer: Optional[csv.writer], errors_lock: Optional[asyncio.Lock]) -> None:
+    """Make a minimal, benign AJAX call if a sesskey is available."""
+    sesskey: Optional[str] = getattr(session, "sesskey", None)
+    if not sesskey:
+        return
+    url = urljoin(base_url, f"/lib/ajax/service.php?sesskey={sesskey}")
+    t0 = time.monotonic()
+    ok = False
+    status = None
+    error_msg = ""
+    try:
+        async with session.post(url, json=_AJAX_TOUCH_PAYLOAD, headers={
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        }) as resp:
+            status = resp.status
+            ok = 200 <= resp.status < 400
+            await resp.read()
+    except Exception as e:
+        ok = False
+        error_msg = str(e)
+    dt = time.monotonic() - t0
+    stats.record(ok, dt)
+    if not ok and errors_writer and errors_lock:
+        async with errors_lock:
+            errors_writer.writerow([
+                time.strftime("%Y-%m-%dT%H:%M:%S"),
+                name,
+                getattr(session, "username", "unknown"),
+                url,
+                status if status is not None else "",
+                error_msg,
+            ])
 
 async def worker(
     name: str,
@@ -496,60 +602,52 @@ async def worker(
     stats: Stats,
     errors_writer: Optional[csv.writer] = None,
     errors_lock: Optional[asyncio.Lock] = None,
+    emulate_browser: bool = False,
+    exclude_re: Optional[re.Pattern] = None,
+    asset_concurrency: int = 6,
 ) -> None:
-    """
-    Consume jobs from the queue and perform HTTP GETs.
+    """Consume jobs; optionally emulate a browser by fetching assets and AJAX."""
+    sem_assets = asyncio.Semaphore(asset_concurrency)
 
-    Each job is a tuple: (session, url_template, param_ranges).
-    On failure, append a row to the shared errors CSV (if provided).
+    async def fetch_asset(url: str) -> None:
+        async with sem_assets:
+            await _fetch_one(session, url, stats, name, errors_writer, errors_lock)
 
-    Parameters
-    ----------
-    name : str
-        Human-friendly worker label (e.g., 'W1').
-    base_url : str
-        Base site URL used to construct absolute URLs.
-    job_q : asyncio.Queue
-        Queue from which jobs are consumed.
-    stats : Stats
-        Aggregator to record outcomes and latencies.
-    errors_writer : Optional[csv.writer], optional
-        CSV writer for errors file; if None, error rows are not written.
-    errors_lock : Optional[asyncio.Lock], optional
-        Asyncio lock protecting writes to the shared errors file.
-    """
     while True:
         try:
             session, url_tpl, param_ranges = await job_q.get()
             if session is None:
-                # 'Poison pill' to shut down the worker gracefully.
                 job_q.task_done()
                 return
 
-            # Resolve placeholders for this request instance.
             path = render_path(url_tpl.path, param_ranges)
             full_url = f"{base_url}{path}"
 
+            # 1) Fetch the primary page
             t0 = time.monotonic()
             ok = False
             status: Optional[int] = None
-            error_msg = ""
+            body: Optional[str] = None
             try:
-                # Allow redirects; we count 2xx/3xx as success to keep signal clean.
                 async with session.get(full_url, allow_redirects=True) as resp:
                     status = resp.status
                     ok = 200 <= resp.status < 400
-                    # Drain body to ensure the connection can be reused by aiohttp.
-                    await resp.read()
+                    ctype = resp.headers.get("Content-Type", "")
+                    if "html" in ctype.lower():
+                        body = await resp.text()
+                    else:
+                        await resp.read()
             except Exception as e:
                 ok = False
-                error_msg = str(e)
+                body = None
+                err = str(e)
+            else:
+                err = ""
 
             dt = time.monotonic() - t0
             stats.record(ok, dt)
 
             if not ok and errors_writer and errors_lock:
-                # Safely append a row to the shared errors file.
                 async with errors_lock:
                     errors_writer.writerow([
                         time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -557,18 +655,32 @@ async def worker(
                         getattr(session, "username", "unknown"),
                         full_url,
                         status if status is not None else "",
-                        error_msg,
+                        err,
                     ])
+
+            # 2) If emulating a browser and the body is HTML, fetch assets & do a small AJAX probe
+            if emulate_browser and body:
+                # Extract and remember sesskey (used for AJAX)
+                sk = maybe_extract_sesskey(body)
+                if sk:
+                    setattr(session, "sesskey", sk)
+
+                # Extract asset URLs from the HTML and fetch them (same-origin only)
+                base_for_assets = base_url
+                assets = extract_asset_urls(body, base_for_assets, exclude_re, same_origin_only=True)
+
+                # Fetch assets with limited concurrency
+                await asyncio.gather(*(fetch_asset(u) for u in assets))
+
+                # Optionally do a harmless AJAX touch call (counts as a request)
+                await _ajax_touch(session, base_url, stats, name, errors_writer, errors_lock)
 
             job_q.task_done()
 
         except asyncio.CancelledError:
-            # Task cancelled by coordinator: exit silently.
             return
         except Exception as e:
-            # Log unexpected errors; do not crash the loop.
             print(f"[{name}] Unexpected worker error: {e}")
-
 
 async def producer(
     job_q: "asyncio.Queue",
@@ -578,34 +690,7 @@ async def producer(
     rpm: int,
     duration_sec: int,
 ) -> None:
-    """
-    Pace requests into the queue to approximate the target RPM.
-
-    Strategy
-    --------
-    * Compute inter-arrival time = 60 / RPM seconds per request.
-    * On each tick, enqueue a job selecting a random user session and template.
-    * Stop after the specified duration.
-
-    Parameters
-    ----------
-    job_q : asyncio.Queue
-        Queue to which jobs are submitted.
-    sessions : List[ClientSession]
-        Already-authenticated sessions for users.
-    url_templates : List[UrlTemplate]
-        Pool of URL templates to sample from.
-    param_ranges : Dict[str, ParamRange]
-        Ranges for parameter substitution in URL templates.
-    rpm : int
-        Target requests per minute to pace.
-    duration_sec : int
-        Total duration (seconds) to keep producing jobs.
-
-    Returns
-    -------
-    None
-    """
+    """Pace requests into the queue to approximate the target RPM (initiated requests)."""
     interval = 60.0 / max(1, rpm)
     end = time.monotonic() + duration_sec
     while time.monotonic() < end:
@@ -614,20 +699,14 @@ async def producer(
         await job_q.put((sess, tpl, param_ranges))
         await asyncio.sleep(interval)
 
-
+# ---------------------------------------------------------------------------
+# CSV utils
+# ---------------------------------------------------------------------------
 def _csv_header() -> List[str]:
-    """
-    Header row used by both progress snapshots and final summary CSVs.
-
-    Returns
-    -------
-    List[str]
-        Column names for the CSV outputs.
-    """
     return [
         "timestamp",
         "elapsed_sec",
-        "target_rpm",
+        "target_initiated_rpm",
         "observed_rpm",
         "total",
         "success",
@@ -637,27 +716,11 @@ def _csv_header() -> List[str]:
         "latency_ms_p99",
     ]
 
-
 def _csv_row(now_iso: str, snap: Dict[str, Any]) -> List[Any]:
-    """
-    Serialize a stats snapshot into a CSV row with a timestamp prefix.
-
-    Parameters
-    ----------
-    now_iso : str
-        Timestamp string in ISO-like format (YYYY-MM-DDTHH:MM:SS).
-    snap : Dict[str, Any]
-        Snapshot as returned by `Stats.snapshot()`.
-
-    Returns
-    -------
-    List[Any]
-        Row ready for csv.writer.writerow.
-    """
     return [
         now_iso,
         snap["elapsed_sec"],
-        snap["target_rpm"],
+        snap["target_initiated_rpm"],
         snap["observed_rpm"],
         snap["total"],
         snap["success"],
@@ -667,7 +730,9 @@ def _csv_row(now_iso: str, snap: Dict[str, Any]) -> List[Any]:
         snap["latency_ms_p99"] if snap["latency_ms_p99"] is not None else "",
     ]
 
-
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
 async def run_load(
     config: Config,
     rpm: int,
@@ -680,63 +745,23 @@ async def run_load(
     login_concurrency: int,
     connector_limit: int,
     connector_limit_per_host: int,
+    emulate_browser: bool,
+    exclude_url_pattern: Optional[str],
 ) -> None:
-    """
-    Run the complete load test: login, spawn workers, produce jobs, and log stats.
-
-    Parameters
-    ----------
-    config : Config
-        Test configuration loaded from JSON.
-    rpm : int
-        Target requests per minute.
-    duration_sec : int
-        Total test duration (seconds).
-    concurrency : int
-        Number of concurrent worker tasks to run.
-    insecure_tls : bool
-        Disable TLS verification for local/self-signed deployments.
-    login_timeout : int
-        Total timeout in seconds for each login attempt.
-    show_progress_every : int
-        Interval (seconds) for progress printouts and CSV snapshots.
-    stats_dir : Path
-        Directory to write CSV stats files.
-    login_concurrency : int
-        Max number of concurrent login attempts.
-    connector_limit : int
-        Max simultaneous connections per session.
-    connector_limit_per_host : int
-        Max per-host connections per session.
-
-    Returns
-    -------
-    None
-    """
     stats_dir.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S")
     progress_csv = stats_dir / f"load_progress_{ts}.csv"
     summary_csv  = stats_dir / f"load_summary_{ts}.csv"
     errors_csv   = stats_dir / f"errors_{ts}.csv"
 
-    # ----- 1) Login phase --------------------------------------------------
+    # Pre-compile exclusion regex if provided
+    exclude_re = re.compile(exclude_url_pattern) if exclude_url_pattern else None
+
+    # ----- 1) Login phase
     print(f"[INFO] Logging in {len(config.users)} users…")
     sem = asyncio.Semaphore(max(1, login_concurrency))
 
     async def login_one(cred: UserCred) -> Optional[ClientSession]:
-        """
-        Throttled login call used by the login fan-out below.
-
-        Parameters
-        ----------
-        cred : UserCred
-            The credentials to attempt.
-
-        Returns
-        -------
-        Optional[ClientSession]
-        A logged-in session or None if authentication failed.
-        """
         async with sem:
             return await login_and_return_session(
                 config.base_url,
@@ -755,8 +780,8 @@ async def run_load(
         return
     print(f"[INFO] {len(sessions)}/{len(config.users)} users logged in successfully.")
 
-    # ----- 2) Writers (progress + errors) BEFORE starting workers ----------
-    with progress_csv.open("w", encoding="utf-8", newline="") as pf,              errors_csv.open("w", encoding="utf-8", newline="") as ef:
+    # ----- 2) Writers BEFORE starting workers
+    with progress_csv.open("w", encoding="utf-8", newline="") as pf,          errors_csv.open("w", encoding="utf-8", newline="") as ef:
 
         pw = csv.writer(pf)
         pw.writerow(_csv_header())
@@ -765,7 +790,7 @@ async def run_load(
         ew.writerow(["timestamp", "worker", "username", "url", "status", "error"])
         errors_lock = asyncio.Lock()
 
-        # ----- 3) Start workers & producer --------------------------------
+        # ----- 3) Start workers & producer
         stats = Stats(target_rpm=rpm)
         job_q: asyncio.Queue = asyncio.Queue(maxsize=rpm * 2 if rpm > 0 else 1000)
 
@@ -777,6 +802,8 @@ async def run_load(
                 stats,
                 errors_writer=ew,
                 errors_lock=errors_lock,
+                emulate_browser=emulate_browser,
+                exclude_re=exclude_re,
             ))
             for i in range(concurrency)
         ]
@@ -786,11 +813,6 @@ async def run_load(
         )
 
         async def progress_task() -> None:
-            """
-            Periodically print a table and append a progress row to CSV.
-
-            Runs until the producer completes.
-            """
             while not prod.done():
                 await asyncio.sleep(show_progress_every)
                 snap = stats.snapshot()
@@ -798,14 +820,14 @@ async def run_load(
                 headers = ["Metric", "Value"]
                 rows = [
                     ("Elapsed (s)", snap["elapsed_sec"]),
-                    ("Target RPM",  snap["target_rpm"]),
-                    ("Observed RPM",snap["observed_rpm"]),
-                    ("Total",       snap["total"]),
-                    ("Success",     snap["success"]),
-                    ("Failures",    snap["failures"]),
-                    ("p50 (ms)",    snap["latency_ms_p50"]),
-                    ("p95 (ms)",    snap["latency_ms_p95"]),
-                    ("p99 (ms)",    snap["latency_ms_p99"]),
+                    ("Target RPM (initiated)",  snap["target_initiated_rpm"]),
+                    ("Observed RPM", snap["observed_rpm"]),
+                    ("Total", snap["total"]),
+                    ("Success", snap["success"]),
+                    ("Failures", snap["failures"]),
+                    ("p50 (ms)", snap["latency_ms_p50"]),
+                    ("p95 (ms)", snap["latency_ms_p95"]),
+                    ("p99 (ms)", snap["latency_ms_p99"]),
                 ]
                 print("\n[PROGRESS]\n" + _format_table(headers, rows))
                 pw.writerow(_csv_row(now_iso, snap))
@@ -832,7 +854,7 @@ async def run_load(
         headers = ["Metric", "Value"]
         rows = [
             ("Elapsed (s)", final_snap["elapsed_sec"]),
-            ("Target RPM",  final_snap["target_rpm"]),
+            ("Target RPM (initiated)",  final_snap["target_initiated_rpm"]),
             ("Observed RPM",final_snap["observed_rpm"]),
             ("Total",       final_snap["total"]),
             ("Success",     final_snap["success"]),
@@ -848,31 +870,24 @@ async def run_load(
             sw.writerow(_csv_header())
             sw.writerow(_csv_row(time.strftime("%Y-%m-%dT%H:%M:%S"), final_snap))
 
-    # ----- 4) Close sessions ----------------------------------------------
+    # ----- 4) Close sessions
     for s in sessions:
         with contextlib.suppress(Exception):
             await s.close()
 
-    # ----- 5) File paths --------------------------------------------------
     print(f"[INFO] Progress CSV: {progress_csv}")
     print(f"[INFO] Errors  CSV:  {errors_csv}")
     print(f"[INFO] Summary CSV:  {summary_csv}")
 
-
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
-    """
-    Parse command-line arguments.
-
-    Returns
-    -------
-    argparse.Namespace
-        Parsed and validated arguments for the test run.
-    """
     p = argparse.ArgumentParser(
-        description="Moodle LMS load generator (async) with throttled login & table/CSV output"
+        description="Moodle LMS load generator (async) with throttled login, CSV output, and optional browser emulation"
     )
     p.add_argument("--config", required=True, help="Path to config.json")
-    p.add_argument("--rpm", type=int, required=True, help="Requests per minute target")
+    p.add_argument("--rpm", type=int, required=True, help="Initiated requests per minute (top-level)")
     p.add_argument("--duration", type=int, required=True, help="Duration in seconds")
     p.add_argument("--concurrency", type=int, default=20, help="Number of concurrent workers")
     p.add_argument("--insecure", action="store_true", help="Ignore TLS verification (local/self-signed)")
@@ -882,27 +897,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--login-concurrency", type=int, default=20, help="Max concurrent login attempts (default: 20)")
     p.add_argument("--connector-limit", type=int, default=8, help="Max simultaneous connections per session (default: 8)")
     p.add_argument("--connector-limit-per-host", type=int, default=4, help="Max per-host connections per session (default: 4)")
+    p.add_argument("--emulate-browser", action="store_true", default=False,
+                   help="If set, fetch asset URLs referenced by HTML and make a minimal AJAX probe.")
+    p.add_argument("--exclude-url-pattern", default=None,
+                   help="Regex; URLs matching this pattern are not executed/downloaded in browser emulation mode.")
     return p.parse_args()
 
-
 def load_config(path: str) -> "Config":
-    """
-    Load and parse the JSON config from disk.
-
-    Parameters
-    ----------
-    path : str
-        Filesystem path to the config JSON.
-
-    Returns
-    -------
-    Config
-        Parsed configuration object.
-    """
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     return Config.from_dict(data)
-
 
 if __name__ == "__main__":
     try:
@@ -926,5 +930,7 @@ if __name__ == "__main__":
             login_concurrency=args.login_concurrency,
             connector_limit=args.connector_limit,
             connector_limit_per_host=args.connector_limit_per_host,
+            emulate_browser=args.emulate_browser,
+            exclude_url_pattern=args.exclude_url_pattern,
         )
     )
