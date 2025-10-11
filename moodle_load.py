@@ -477,6 +477,7 @@ async def login_and_return_session(
     try:
         ok = await login_user(session, base_url, cred.username, cred.password)
         if ok:
+            setattr(session, "username", cred.username)
             return session
         await session.close()
         return None
@@ -553,6 +554,7 @@ async def worker(
                     errors_writer.writerow([
                         time.strftime("%Y-%m-%dT%H:%M:%S"),
                         name,
+                        getattr(session, "username", "unknown"),
                         full_url,
                         status if status is not None else "",
                         error_msg,
@@ -760,7 +762,7 @@ async def run_load(
         pw.writerow(_csv_header())
 
         ew = csv.writer(ef)
-        ew.writerow(["timestamp", "worker", "url", "status", "error"])
+        ew.writerow(["timestamp", "worker", "username", "url", "status", "error"])
         errors_lock = asyncio.Lock()
 
         # ----- 3) Start workers & producer --------------------------------
