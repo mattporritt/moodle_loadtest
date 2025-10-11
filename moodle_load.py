@@ -658,7 +658,8 @@ async def worker(
                         err,
                     ])
 
-            # 2) If emulating a browser and the body is HTML, fetch assets & do a small AJAX probe
+            # 2) If emulating a browser and the body is HTML, fetch same-origin assets (respect --exclude-url-pattern)
+            # and perform a minimal AJAX 'touch' to better mimic browser behavior.
             if emulate_browser and body:
                 # Extract and remember sesskey (used for AJAX)
                 sk = maybe_extract_sesskey(body)
@@ -703,6 +704,9 @@ async def producer(
 # CSV utils
 # ---------------------------------------------------------------------------
 def _csv_header() -> List[str]:
+    """
+    Return the CSV header shared by progress and summary files. Uses 'target_initiated_rpm' terminology.
+    """
     return [
         "timestamp",
         "elapsed_sec",
@@ -717,6 +721,9 @@ def _csv_header() -> List[str]:
     ]
 
 def _csv_row(now_iso: str, snap: Dict[str, Any]) -> List[Any]:
+    """
+    Serialize a Stats snapshot with a timestamp prefix for CSV writing.
+    """
     return [
         now_iso,
         snap["elapsed_sec"],
@@ -883,6 +890,10 @@ async def run_load(
 # CLI
 # ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
+    """
+    Parse CLI arguments. '--rpm' represents initiated (top-level) requests per minute.
+    Use '--emulate-browser' to fetch assets and do minimal AJAX; use '--exclude-url-pattern' to skip URLs.
+    """
     p = argparse.ArgumentParser(
         description="Moodle LMS load generator (async) with throttled login, CSV output, and optional browser emulation"
     )
@@ -904,6 +915,9 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 def load_config(path: str) -> "Config":
+    """
+    Load config.json from disk and construct a Config instance.
+    """
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     return Config.from_dict(data)
