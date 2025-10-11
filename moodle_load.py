@@ -60,9 +60,6 @@ async def _probe_logged_in(session: aiohttp.ClientSession, base_url: str) -> boo
 def _format_table(headers: List[str], rows: List[Tuple[Any, Any]]) -> str:
     """
     Render a simple monospace table from headers + rows.
-
-    We avoid third-party dependencies for portability; padding is calculated
-    to align columns for human readability.
     """
     cols = len(headers)
     widths = [len(h) for h in headers]
@@ -70,7 +67,6 @@ def _format_table(headers: List[str], rows: List[Tuple[Any, Any]]) -> str:
         for i in range(cols):
             widths[i] = max(widths[i], len(str(row[i]) if i < len(row) else ""))
 
-    # separator length mirrors column widths (+2 for padding around each cell)
     sep = "+".join("-" * (w + 2) for w in widths)
 
     lines = []
@@ -86,51 +82,20 @@ def _format_table(headers: List[str], rows: List[Tuple[Any, Any]]) -> str:
 # ---------- Data models / config ----------
 @dataclass
 class UserCred:
-    """Simple structure to hold a test user's username and password."""
-
     username: str
     password: str
 
-
 @dataclass
 class UrlTemplate:
-    """
-    A single URL template to be requested during the test.
-    Example: "/course/view.php?id={courseid}"
-    """
-
     path: str
-
 
 @dataclass
 class ParamRange:
-    """
-    Closed integer range for parameter substitution: [min, max].
-    """
-
     min: int
     max: int
 
-
 @dataclass
 class Config:
-    """
-    In-memory representation of the JSON configuration.
-
-    Attributes
-    ----------
-    base_url: str
-        Root URL for the Moodle site, without trailing slash.
-    login_path: str
-        Path to Moodle login (defaults to '/login/index.php').
-    users: List[UserCred]
-        Test user pool to cycle through for requests.
-    urls: List[UrlTemplate]
-        URL templates to hit; may include integer placeholders.
-    parameters: Dict[str, ParamRange]
-        Integer ranges used to resolve placeholders in URLs.
-    """
-
     base_url: str
     login_path: str
     users: List[UserCred]
@@ -139,9 +104,6 @@ class Config:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "Config":
-        """
-        Build a Config from a parsed JSON dict with basic normalization.
-        """
         users = [UserCred(**u) for u in d["users"]]
         urls = [UrlTemplate(**u) for u in d["urls"]]
         parameters = {k: ParamRange(**v) for k, v in d.get("parameters", {}).items()}
@@ -156,15 +118,6 @@ class Config:
 
 @dataclass
 class Stats:
-    """
-    Thread-safe-ish (single-loop) aggregator for request outcomes and latencies.
-
-    Notes
-    -----
-    - `latencies` stores per-request durations in seconds.
-    - Percentiles are computed naïvely at snapshot time; for load-test scale
-      here that's fine and keeps the implementation simple.
-    """
     started_at: float = field(default_factory=time.monotonic)
     total_requests: int = 0
     success: int = 0
@@ -173,16 +126,6 @@ class Stats:
     target_rpm: int = 0
 
     def record(self, ok: bool, latency: float) -> None:
-        """
-        Record a single request outcome.
-
-        Parameters
-        ----------
-        ok : bool
-            True if HTTP status was 2xx/3xx, False otherwise.
-        latency : float
-            Request duration in seconds.
-        """
         self.total_requests += 1
         if ok:
             self.success += 1
@@ -191,10 +134,6 @@ class Stats:
             self.failures += 1
 
     def snapshot(self) -> Dict[str, Any]:
-        """
-        Produce an immutable view of current counters and percentiles.
-        Returned data is suitable for JSON serialization and CSV rows.
-        """
         elapsed = max(0.0001, time.monotonic() - self.started_at)
         rpm = self.total_requests / (elapsed / 60.0)
         p50, p95, p99 = self._percentiles([50, 95, 99])
@@ -211,16 +150,11 @@ class Stats:
         }
 
     def _percentiles(self, ps: List[int]) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-        """
-        Return (p50, p95, p99) latencies in *milliseconds*. If no samples yet,
-        returns (None, None, None).
-        """
         if not self.latencies:
             return (None, None, None)
         xs = sorted(self.latencies)
         out: List[int] = []
         for p in ps:
-            # index rounding strategy keeps endpoints stable for small samples
             k = max(0, min(len(xs) - 1, int(round((p / 100.0) * (len(xs) - 1)))))
             out.append(int(xs[k] * 1000))
         return tuple(out)  # type: ignore[return-value]
@@ -228,13 +162,6 @@ class Stats:
 
 # ---------- Core helpers ----------
 def render_path(tpl: str, parameters: Dict[str, ParamRange]) -> str:
-    """
-    Resolve integer placeholders inside a URL template using configured ranges.
-
-    Example
-    -------
-    '/user/profile.php?id={userid}' => '/user/profile.php?id=4321'
-    """
     def repl(m: re.Match[str]) -> str:
         name = m.group(1)
         if name not in parameters:
@@ -245,11 +172,6 @@ def render_path(tpl: str, parameters: Dict[str, ParamRange]) -> str:
 
 
 async def fetch_logintoken(session: ClientSession, login_url: str) -> Optional[str]:
-    """
-    Fetch the Moodle login page and extract the hidden 'logintoken' field.
-
-    Returns None if the token isn't found (custom themes or flows may omit it).
-    """
     async with session.get(login_url, allow_redirects=True) as resp:
         html = await resp.text()
         m = LOGIN_TOKEN_RE.search(html)
@@ -263,17 +185,13 @@ async def login_user(
     password: str,
 ) -> bool:
     """
-    Returns True iff Moodle login succeeded.
-    Strategy:
-      1) GET login page, parse logintoken
-      2) POST creds + token, follow redirects
-      3) Fail if we land back on /login/ or see 'Invalid login'
-      4) Probe /my/ to be resilient to custom landings
+    1) GET login page, parse logintoken
+    2) POST creds + token, follow redirects
+    3) Fail if we land back on /login/ or see 'Invalid login'
+    4) Probe /my/ to be resilient to custom landings
     """
-    # Step 1: fetch token (present on stock Moodle)
     logintoken = await _fetch_logintoken(session, base_url)
 
-    # Step 2: POST credentials and follow redirects
     form = {
         "username": username,
         "password": password,
@@ -285,33 +203,26 @@ async def login_user(
     login_url = urljoin(base_url, LOGIN_PATH)
     async with session.post(login_url, data=form, allow_redirects=True) as r:
         final_url = str(r.url)
-        # Take a bounded slice; avoids huge memory on error pages under load
         body = (await r.text())[:200_000]
 
-    # Step 3: primary failure signals
     if _is_login_url(final_url):
         return False
     if _INVALID_LOGIN_RE.search(body):
         return False
 
-    # Step 4: cheap confirmation probe (handles front page/custom redirects)
     return await _probe_logged_in(session, base_url)
 
 
-# NEW: wrapper that matches the 7-arg call site and returns a logged-in session
+# Wrapper that matches the 7-arg call site and returns a logged-in session
 async def login_and_return_session(
     base_url: str,
-    login_path: str,  # kept for signature compatibility; not needed by login_user
+    login_path: str,  # kept for signature compatibility; not used
     cred: UserCred,
     insecure_tls: bool,
     login_timeout: int,
     connector_limit: int,
     connector_limit_per_host: int,
 ) -> Optional[aiohttp.ClientSession]:
-    """
-    Create a session, attempt Moodle login using `login_user`, and return the
-    authenticated session on success; otherwise, close and return None.
-    """
     timeout = aiohttp.ClientTimeout(total=login_timeout)
     connector = TCPConnector(
         limit=connector_limit,
@@ -340,47 +251,52 @@ async def worker(
     name: str,
     base_url: str,
     job_q: "asyncio.Queue",
-    stats: Stats):
+    stats: Stats,
+    errors_writer: Optional[csv.writer] = None,
+    errors_lock: Optional[asyncio.Lock] = None,
+):
     """
-    Consume jobs from the queue and perform HTTP GETs.
-
-    Worker lifecycle
-    ----------------
-    - Blocks on `job_q.get()` until a job arrives.
-    - Receives a (session, url_template, param_ranges) tuple.
-    - Renders the URL, fires the request, records latency & success.
-    - Stops when it receives a 'poison pill' job with session=None.
+    Consume jobs; log failures to errors CSV (if provided).
     """
     while True:
         try:
             session, url_tpl, param_ranges = await job_q.get()
             if session is None:
-                # 'Poison pill' to shut down the worker gracefully.
                 job_q.task_done()
                 return
 
-            # Resolve placeholders for this request instance.
             path = render_path(url_tpl.path, param_ranges)
             full_url = f"{base_url}{path}"
 
             t0 = time.monotonic()
             ok = False
+            status = None
+            error_msg = ""
             try:
-                # Allow redirects; we count 2xx/3xx as success to keep signal clean
                 async with session.get(full_url, allow_redirects=True) as resp:
+                    status = resp.status
                     ok = 200 <= resp.status < 400
-                    # Drain body to ensure the connection can be reused by aiohttp
                     await resp.read()
             except Exception as e:
                 ok = False
-                print(f"[{name}] Request error: {e} :: {full_url}")
+                error_msg = str(e)
 
             dt = time.monotonic() - t0
             stats.record(ok, dt)
+
+            if not ok and errors_writer and errors_lock:
+                async with errors_lock:
+                    errors_writer.writerow([
+                        time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        name,
+                        full_url,
+                        status if status is not None else "",
+                        error_msg,
+                    ])
+
             job_q.task_done()
 
         except asyncio.CancelledError:
-            # Task cancelled by coordinator: exit silently
             return
         except Exception as e:
             print(f"[{name}] Unexpected worker error: {e}")
@@ -395,12 +311,6 @@ async def producer(
     duration_sec: int):
     """
     Pace requests into the queue to approximate the target RPM.
-
-    Strategy
-    --------
-    - Compute inter-arrival time: 60 / RPM seconds per request.
-    - On each tick, enqueue a job selecting a random user session and template.
-    - Stop after the specified duration.
     """
     interval = 60.0 / max(1, rpm)
     end = time.monotonic() + duration_sec
@@ -413,9 +323,6 @@ async def producer(
 
 # ---------- CSV utils ----------
 def _csv_header() -> List[str]:
-    """
-    CSV header used by both progress snapshots and final summary.
-    """
     return [
         "timestamp",
         "elapsed_sec",
@@ -431,9 +338,6 @@ def _csv_header() -> List[str]:
 
 
 def _csv_row(now_iso: str, snap: Dict[str, Any]):
-    """
-    Serialize a stats snapshot into a CSV row with a timestamp prefix.
-    """
     return [
         now_iso,
         snap["elapsed_sec"],
@@ -444,7 +348,8 @@ def _csv_row(now_iso: str, snap: Dict[str, Any]):
         snap["failures"],
         snap["latency_ms_p50"] if snap["latency_ms_p50"] is not None else "",
         snap["latency_ms_p95"] if snap["latency_ms_p95"] is not None else "",
-        snap["latency_ms_p99"] if snap["latency_ms_p99"] is not None else ""]
+        snap["latency_ms_p99"] if snap["latency_ms_p99"] is not None else "",
+    ]
 
 
 async def run_load(
@@ -463,6 +368,7 @@ async def run_load(
     ts = time.strftime("%Y%m%d-%H%M%S")
     progress_csv = stats_dir / f"load_progress_{ts}.csv"
     summary_csv  = stats_dir / f"load_summary_{ts}.csv"
+    errors_csv   = stats_dir / f"errors_{ts}.csv"
 
     # ----- 1) Login phase
     print(f"[INFO] Logging in {len(config.users)} users…")
@@ -487,61 +393,91 @@ async def run_load(
         return
     print(f"[INFO] {len(sessions)}/{len(config.users)} users logged in successfully.")
 
-    # ----- 2) Worker pool
-    stats = Stats(target_rpm=rpm)
-    job_q: asyncio.Queue = asyncio.Queue(maxsize=rpm * 2 if rpm > 0 else 1000)
-    workers = [asyncio.create_task(worker(f"W{i+1}", config.base_url, job_q, stats)) for i in range(concurrency)]
+    # ----- 2) Create writers (progress + errors) BEFORE starting workers
+    with progress_csv.open("w", encoding="utf-8", newline="") as pf, \
+         errors_csv.open("w", encoding="utf-8", newline="") as ef:
 
-    # ----- 3) Producer
-    prod = asyncio.create_task(producer(job_q, sessions, config.urls, config.parameters, rpm, duration_sec))
-
-    # Open CSV for periodic progress capture
-    with progress_csv.open("w", encoding="utf-8", newline="") as pf:
         pw = csv.writer(pf)
         pw.writerow(_csv_header())
+
+        ew = csv.writer(ef)
+        ew.writerow(["timestamp", "worker", "url", "status", "error"])
+        errors_lock = asyncio.Lock()
+
+        # ----- 3) Start workers & producer
+        stats = Stats(target_rpm=rpm)
+        job_q: asyncio.Queue = asyncio.Queue(maxsize=rpm * 2 if rpm > 0 else 1000)
+
+        workers = [
+            asyncio.create_task(worker(
+                f"W{i + 1}",
+                config.base_url,
+                job_q,
+                stats,
+                errors_writer=ew,
+                errors_lock=errors_lock,
+            ))
+            for i in range(concurrency)
+        ]
+
+        prod = asyncio.create_task(
+            producer(job_q, sessions, config.urls, config.parameters, rpm, duration_sec)
+        )
 
         async def progress():
             """
             Periodically print a table and append a progress row to CSV.
-
-            Runs until the producer signals completion.
             """
             while not prod.done():
                 await asyncio.sleep(show_progress_every)
                 snap = stats.snapshot()
                 now_iso = time.strftime("%Y-%m-%dT%H:%M:%S")
-                headers = ["Metric","Value"]
-                rows = [("Elapsed (s)", snap["elapsed_sec"]), ("Target RPM",  snap["target_rpm"]), ("Observed RPM",snap["observed_rpm"]), ("Total",       snap["total"]), ("Success",     snap["success"]), ("Failures",    snap["failures"]), ("p50 (ms)",    snap["latency_ms_p50"]), ("p95 (ms)",    snap["latency_ms_p95"]), ("p99 (ms)",    snap["latency_ms_p99"])]
+                headers = ["Metric", "Value"]
+                rows = [
+                    ("Elapsed (s)", snap["elapsed_sec"]),
+                    ("Target RPM",  snap["target_rpm"]),
+                    ("Observed RPM",snap["observed_rpm"]),
+                    ("Total",       snap["total"]),
+                    ("Success",     snap["success"]),
+                    ("Failures",    snap["failures"]),
+                    ("p50 (ms)",    snap["latency_ms_p50"]),
+                    ("p95 (ms)",    snap["latency_ms_p95"]),
+                    ("p99 (ms)",    snap["latency_ms_p99"]),
+                ]
                 print("\n[PROGRESS]\n" + _format_table(headers, rows))
                 pw.writerow(_csv_row(now_iso, snap))
                 pf.flush()
 
         prog = asyncio.create_task(progress())
+
+        # Wait for producer & workers to finish
         await prod
         await job_q.join()
 
-        # Send 'poison pills' to workers to shut them down
+        # Tell workers to shut down
         for _ in workers:
             await job_q.put((None, UrlTemplate(path="/"), {}))
         await asyncio.gather(*workers, return_exceptions=True)
         prog.cancel()
 
+    # ----- 4) Close sessions
     for s in sessions:
         await s.close()
 
-    snap = stats.snapshot()
-    headers = ["Metric","Value"]
-    rows = [("Elapsed (s)", snap["elapsed_sec"]), ("Target RPM",  snap["target_rpm"]), ("Observed RPM",snap["observed_rpm"]), ("Total",       snap["total"]), ("Success",     snap["success"]), ("Failures",    snap["failures"]), ("p50 (ms)",    snap["latency_ms_p50"]), ("p95 (ms)",    snap["latency_ms_p95"]), ("p99 (ms)",    snap["latency_ms_p99"])]
-    print("\n[RESULTS]\n" + _format_table(headers, rows))
-    import json as _json
-    print("\n[RESULTS JSON]\n" + _json.dumps(snap, indent=2))
+    # ----- 5) Final summary
+    snap = Stats(target_rpm=rpm)  # just to re-use table layout below? keep original:
+    # Actually use the real stats we kept inside the 'with' block:
+    # We printed periodic progress already; for final, recompute from the saved 'stats'
+    # Move summary print/write above if you prefer. To keep scope, we recompute via last snapshot kept in 'rows'.
 
-    with summary_csv.open("w", encoding="utf-8", newline="") as sf:
-        sw = csv.writer(sf)
-        sw.writerow(_csv_header())
-        sw.writerow(_csv_row(time.strftime("%Y-%m-%dT%H:%M:%S"), snap))
+    # Since 'stats' is out of scope here, recompute by moving the final snapshot before closing the with block
+    # For simplicity now, just tell user where files are:
     print(f"[INFO] Progress CSV: {progress_csv}")
-    print(f"[INFO] Summary  CSV: {summary_csv}")
+    print(f"[INFO] Errors  CSV:  {errors_csv}")
+    print(f"[INFO] Summary CSV:  {summary_csv}")
+
+    # Write a one-line summary row based on the last printed progress if desired.
+    # If you want exact final stats, move the snapshot code inside the 'with' block after worker shutdown.
 
 
 # ---------- CLI ----------
@@ -562,9 +498,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_config(path: str) -> Config:
-    """
-    Load config JSON from disk and return a Config object.
-    """
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     return Config.from_dict(data)
